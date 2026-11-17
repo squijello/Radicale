@@ -2,6 +2,7 @@
 # for email notifications
 # Copyright © 2025-2025 Nate Harris
 # Copyright © 2026-2026 Peter Bieringer <pb@bieringer.de>
+# Copyright © 2026-2026 Contributors to Radicale
 #
 # This library is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -40,6 +41,7 @@ from radicale.hook.email.scheduling import (PlannedMessage, build_itip_ics,
                                             check_ownership,
                                             mapped_owner_email, parse_event,
                                             parse_owner_map, plan_messages,
+                                            prepare_itip_upload,
                                             resolve_owner_identities)
 from radicale.log import logger
 
@@ -1096,6 +1098,14 @@ class Hook(BaseHook):
         if isinstance(notification_item, HookNotificationItem):
             self._process_event_and_notify(notification_item)
 
+    def prepare_upload(self, notification_item) -> Optional[str]:
+        """Normalize an owned iTIP event revision before its member PUT."""
+        if not self.email_config.itip_enabled or not notification_item.is_calendar_item:
+            return None
+        return prepare_itip_upload(
+            notification_item.old_content, notification_item.new_content,
+            self._owner_identities(notification_item))
+
     def _send_planned(self, planned, email_event: EmailEvent,
                       previous_item_str, new_item_str,
                       reply_to_email: Optional[str] = None) -> None:
@@ -1113,13 +1123,17 @@ class Hook(BaseHook):
             if message.method == "CANCEL" and previous_item_str:
                 template_event = _read_event(vobject_data=previous_item_str)
                 source_ics = previous_item_str
-                # Ensure the cancellation supersedes both event revisions.
-                # For a deleted event this reduces to old + 1.
+                # Updates were assigned their stored revision before upload.
+                # A DELETE has no new stored event, so it uses old + 1.
                 old_parsed = parse_event(previous_item_str)
                 new_parsed = parse_event(new_item_str) if new_item_str else None
                 old_seq = old_parsed.sequence if old_parsed else 0
-                new_seq = new_parsed.sequence if new_parsed else 0
-                cancel_sequence = max(old_seq, new_seq) + 1
+                if message.kind == "deleted":
+                    cancel_sequence = old_seq + 1
+                else:
+                    if new_parsed is None:
+                        raise ValueError("updated cancellation requires a stored event revision")
+                    cancel_sequence = new_parsed.sequence
             else:
                 template_event = email_event
                 source_ics = new_item_str

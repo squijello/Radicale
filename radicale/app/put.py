@@ -5,6 +5,7 @@
 # Copyright © 2017-2020 Unrud <unrud@outlook.com>
 # Copyright © 2020-2023 Tuna Celik <tuna@jakpark.com>
 # Copyright © 2024-2026 Peter Bieringer <pb@bieringer.de>
+# Copyright © 2026-2026 Contributors to Radicale
 #
 # This library is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -313,6 +314,7 @@ class ApplicationPartPut(ApplicationBase):
                         exc_info=prepared_exc_info)
                     return httputils.BAD_REQUEST
 
+            representation_changed = False
             if write_whole_collection:
                 try:
                     col, replaced_items, new_item_hrefs = self._storage.create_collection(
@@ -363,6 +365,33 @@ class ApplicationPartPut(ApplicationBase):
 
                 href = posixpath.basename(pathutils.strip_path(path))
                 try:
+                    # Older third-party hooks need not implement preparation.
+                    prepare_upload = getattr(self._hook, "prepare_upload", None)
+                    if self._hook.enabled and prepare_upload is not None:
+                        original_content = prepared_item.serialize()
+                        replacement = prepare_upload(HookNotificationItem(
+                            notification_item_type=HookNotificationItemTypes.UPSERT,
+                            path=access.path, content=original_content,
+                            content_type=prepared_item.name,
+                            old_content=item.serialize() if item else None,
+                            new_content=original_content, actor=actor))
+                        if replacement is not None:
+                            components = radicale_item.read_components(replacement)
+                            radicale_item.check_and_sanitize_items(
+                                components, is_collection=False, tag=parent_item.tag,
+                                max_vevent_rrule_occurrence=self._max_vevent_rrule_occurrence)
+                            if len(components) != 1:
+                                raise ValueError("Hook preparation must return one item")
+                            replacement_item = radicale_item.Item(
+                                collection_path=parent_item.path, vobject_item=components[0])
+                            replacement_item.prepare()
+                            if (replacement_item.uid != prepared_item.uid or
+                                    replacement_item.component_name != prepared_item.component_name):
+                                raise ValueError("Hook preparation must preserve the item identity")
+                            if len(replacement_item.serialize()) > self._max_resource_size:
+                                return httputils.PRECONDITION_FAILED
+                            representation_changed = replacement_item.serialize() != original_content
+                            prepared_item = replacement_item
                     uploaded_item, replaced_item = parent_item.upload(href, prepared_item)
                     etag = uploaded_item.etag
                     if self._hook.enabled:
@@ -396,8 +425,10 @@ class ApplicationPartPut(ApplicationBase):
                         return httputils.BAD_REQUEST
                 if (item and item.uid == prepared_item.uid):
                     logger.debug("PUT request updated existing item %r", path)
-                    headers = {"ETag": etag}
+                    # A transformed PUT needs a GET before the client can
+                    # treat an ETag as validating its cached representation.
+                    headers = {} if representation_changed else {"ETag": etag}
                     return client.NO_CONTENT, headers, None, None
 
-            headers = {"ETag": etag}
+            headers = {} if representation_changed else {"ETag": etag}
             return client.CREATED, headers, None, None

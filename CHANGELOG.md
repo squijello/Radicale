@@ -1,6 +1,7 @@
 # Changelog
 
 ## 3.9.3.dev
+* Fix: [hook/email] persist scheduling revisions before notifications, including events without SEQUENCE, so cancellations and reinvitations stay ordered
 * Fix: [hook/email] distinguish event cancellation from attendee removal, send CANCEL for STATUS:CANCELLED, and omit alarms from cancellation messages
 * Add: [hook] itip_owner_map: ordered full-string username regex rules with brace-style capture replacements; escape metacharacters in existing literal keys
 * Add: [hook] itip_owner_reply_to: route ordinary replies to the authenticated actor's explicitly mapped address

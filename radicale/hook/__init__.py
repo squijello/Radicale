@@ -2,6 +2,7 @@
 # for email notifications
 # Copyright © 2020-2023 Tuna Celik <tuna@jakpark.com>
 # Copyright © 2025-2025 Nate Harris
+# Copyright © 2026-2026 Contributors to Radicale
 #
 # This library is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -18,7 +19,7 @@
 
 import json
 from enum import Enum
-from typing import Sequence
+from typing import Optional, Sequence
 
 from radicale import pathutils, utils
 from radicale.log import logger
@@ -61,6 +62,17 @@ class BaseHook:
     def notify(self, notification_item):
         """Upload a new or replace an existing item."""
         raise NotImplementedError
+
+    def prepare_upload(self, notification_item) -> Optional[str]:
+        """Return replacement content for a member PUT, or None unchanged.
+
+        Called under the storage write lock after request preconditions,
+        before the item is stored. The notification contains the new
+        content, previous content and authenticated actor. A replacement
+        must preserve the item identity and pass normal item validation.
+        Exceptions abort the upload; this method must not send notifications.
+        """
+        return None
 
 
 class HookNotificationItemTypes(Enum):

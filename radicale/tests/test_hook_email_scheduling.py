@@ -523,8 +523,11 @@ class TestReplyToEndToEnd(BaseTest):
                           recipient="bob@example.com", sequence=2)
         self.put(path, event([ALICE], 3).replace("LOCATION:Home", "LOCATION:Office"),
                  check=204, login="jeff:password")
+        _, _, stored = self.request("GET", path, check=200, login="jeff:password")
+        assert int(vobject.readOne(stored).vevent.sequence.value) == 3
+        # Member cancellation uses the stored revision; deletion advances it.
         self._assert_call(4, reply_to="jeff@reply.example", method="CANCEL",
-                          recipient="bob@example.com", sequence=4)
+                          recipient="bob@example.com", sequence=3)
         self.delete(path, login="jeff:password")
         self._assert_call(5, reply_to="jeff@reply.example", method="CANCEL",
                           recipient="alice@example.com", sequence=4)
@@ -946,20 +949,331 @@ class TestBuilderGuardAndCancelSequence:
         itip = build_itip_ics(old, "CANCEL", "carol@example.com")
         assert "SEQUENCE:4" in itip
 
-    def test_cancel_sequence_for_removed_attendee_uses_max_plus_one(self):
-        # Simulate the hook's _send_planned calculation: an update
-        # that removes Carol and bumps SEQUENCE from 1 to 5 must
-        # cancel with 6, not 2, so the CANCEL is newer than the
-        # updated event as well as the old one.
-        from radicale.hook.email.scheduling import parse_event
-        old = _event([ALICE, BOB, CAROL], sequence=1)
-        new = _event([ALICE, BOB], sequence=5, dtstart="20261113T210000Z")
-        old_seq = parse_event(old).sequence
-        new_seq = parse_event(new).sequence
-        itip = build_itip_ics(old, "CANCEL", "carol@example.com",
-                              sequence=max(old_seq, new_seq) + 1)
-        assert "SEQUENCE:6" in itip
-        assert "METHOD:CANCEL" in itip
+    @pytest.mark.parametrize("sequence,expected", [(None, 1), (7, 7)])
+    def test_cancel_serializes_a_sequence_absent_from_source(self, sequence, expected):
+        source = _event([ALICE], sequence=0).replace("SEQUENCE:0\n", "")
+        wire = vobject.readOne(build_itip_ics(
+            source, "CANCEL", "alice@example.com", sequence=sequence))
+        assert wire.method.value == "CANCEL"
+        assert len(wire.vevent.sequence_list) == 1
+        assert int(wire.vevent.sequence.value) == expected
+
+    def test_preparation_serializes_a_sequence_absent_from_upload(self):
+        from radicale.hook.email.scheduling import prepare_itip_upload
+
+        source = _event([ALICE], sequence=0).replace("SEQUENCE:0\n", "")
+        assert prepare_itip_upload(source, source, OWNER) is None
+        updated = source.replace("LOCATION:Home", "LOCATION:Away")
+        prepared = prepare_itip_upload(source, updated, OWNER)
+        assert prepared is not None
+        stored = vobject.readOne(prepared)
+        assert len(stored.vevent.sequence_list) == 1
+        assert int(stored.vevent.sequence.value) == 1
+        assert stored.vevent.location.value == "Away"
+
+    @pytest.mark.parametrize("sequence", [-1, 2147483648])
+    def test_builder_rejects_out_of_range_cancellation_revision(self, sequence):
+        with pytest.raises(ValueError, match="SEQUENCE"):
+            build_itip_ics(_event([ALICE]), "CANCEL", "alice@example.com",
+                           sequence=sequence)
+
+    def test_builder_rejects_exhausted_deletion_revision(self):
+        with pytest.raises(ValueError, match="SEQUENCE"):
+            build_itip_ics(_event([ALICE], sequence=2147483647),
+                           "CANCEL", "alice@example.com")
+
+
+class TestStoredSchedulingRevision(BaseTest):
+    """Persist the revision used by actual outgoing scheduling messages."""
+
+    def setup_method(self):
+        TestHookWiring.setup_method(self)
+        self.mkcalendar("/calendar.ics/", login="jeff:password")
+        self.path = "/calendar.ics/revisions.ics"
+        self.start = datetime.now() + timedelta(days=1)
+
+    def _source(self, attendees, sequence):
+        return TestHookWiring._future_event(self, attendees, self.start).replace(
+            "SEQUENCE:1", "SEQUENCE:%d" % sequence)
+
+    def _capture(self, monkeypatch):
+        from email import message_from_string, policy
+
+        from radicale.hook.email import EmailConfig
+
+        sent = []
+
+        def capture_smtp(config, text, to_addresses):
+            message = message_from_string(text, policy=policy.default)
+            calendar = [part for part in message.walk()
+                        if part.get_content_type() == "text/calendar"]
+            assert len(calendar) == 1
+            sent.append(vobject.readOne(calendar[0].get_payload(decode=True).decode("utf-8")))
+            return True
+
+        monkeypatch.setattr(EmailConfig, "_smtp_send", capture_smtp)
+        self.configure({"hook": {"dryrun": "False"}})
+        return sent
+
+    def _stored(self):
+        _, headers, body = self.request("GET", self.path, check=200, login="jeff:password")
+        from radicale.item import get_etag
+        assert headers["ETag"] == get_etag(body)
+        return headers["ETag"], vobject.readOne(body)
+
+    @pytest.mark.parametrize("operation", ["details", "remove", "cancel", "delete"])
+    def test_implicit_zero_revision_reaches_stored_and_wire_updates(self, monkeypatch, operation):
+        sent = self._capture(monkeypatch)
+        source = self._source([ALICE], 0).replace("SEQUENCE:0\n", "")
+        self.put(self.path, source, login="jeff:password")
+        original_etag, stored = self._stored()
+        assert "sequence" not in stored.vevent.contents
+        assert len(sent) == 1 and sent[0].method.value == "REQUEST"
+        assert "sequence" not in sent[0].vevent.contents
+        sent.clear()
+
+        if operation == "delete":
+            self.delete(self.path, login="jeff:password")
+            self.get(self.path, check=404, login="jeff:password")
+        else:
+            if operation == "details":
+                updated = source.replace("LOCATION:Home", "LOCATION:Away")
+            elif operation == "remove":
+                updated = self._source([], 0).replace("SEQUENCE:0\n", "")
+            else:
+                updated = source.replace("END:VEVENT", "STATUS:CANCELLED\nEND:VEVENT")
+            _, headers, _ = self.request(
+                "PUT", self.path, updated, check=204,
+                login="jeff:password", http_if_match=original_etag)
+            assert "ETag" not in headers
+            current_etag, stored = self._stored()
+            assert current_etag != original_etag
+            assert int(stored.vevent.sequence.value) == 1
+        assert len(sent) == 1
+        assert sent[0].method.value == ("REQUEST" if operation == "details" else "CANCEL")
+        assert int(sent[0].vevent.sequence.value) == 1
+
+        if operation in ("remove", "cancel"):
+            sent.clear()
+            self.put(self.path, source, check=204, login="jeff:password")
+            _, stored = self._stored()
+            assert int(stored.vevent.sequence.value) == 2
+            assert len(sent) == 1 and sent[0].method.value == "REQUEST"
+            assert int(sent[0].vevent.sequence.value) == 2
+
+    @pytest.mark.parametrize("change,expected", [("none", 5), ("response", 5), ("details", 6)])
+    def test_omitted_sequence_preserves_existing_revision_floor(self, monkeypatch, change, expected):
+        sent = self._capture(monkeypatch)
+        source = self._source([("Alice", "alice@example.com", ";PARTSTAT=NEEDS-ACTION")], 5)
+        self.put(self.path, source, login="jeff:password")
+        old_etag, _ = self._stored()
+        sent.clear()
+        updated = source.replace("SEQUENCE:5\n", "")
+        if change == "response":
+            updated = updated.replace("PARTSTAT=NEEDS-ACTION", "PARTSTAT=ACCEPTED")
+        elif change == "details":
+            updated = updated.replace("LOCATION:Home", "LOCATION:Away")
+        _, headers, _ = self.request("PUT", self.path, updated, check=204,
+                                     login="jeff:password", http_if_match=old_etag)
+        assert "ETag" not in headers
+        new_etag, stored = self._stored()
+        assert (new_etag == old_etag) == (change == "none")
+        assert int(stored.vevent.sequence.value) == expected
+        assert len(sent) == (1 if change == "details" else 0)
+        if change == "response":
+            assert stored.vevent.attendee.params["PARTSTAT"] == ["ACCEPTED"]
+        if sent:
+            assert int(sent[0].vevent.sequence.value) == expected
+
+    @pytest.mark.parametrize("supplied,expected", [
+        ((1, 1), (2, 3)), ((2, 2), (2, 3)), ((8, 13), (8, 13))])
+    def test_remove_readd_persists_strictly_increasing_wire_revision(
+            self, monkeypatch, supplied, expected):
+        sent = self._capture(monkeypatch)
+        self.put(self.path, self._source([ALICE], 1), login="jeff:password")
+        previous_etag, _ = self._stored()
+        for attendees, sequence, revision in zip(([], [ALICE]), supplied, expected):
+            _, headers, _ = self.request(
+                "PUT", self.path, self._source(attendees, sequence), check=204,
+                login="jeff:password", http_if_match=previous_etag)
+            if sequence != revision:
+                assert "ETag" not in headers
+            current_etag, stored = self._stored()
+            assert current_etag != previous_etag
+            assert int(stored.vevent.sequence.value) == revision
+            assert int(sent[-1].vevent.sequence.value) == revision
+            previous_etag = current_etag
+        assert [message.method.value for message in sent] == ["REQUEST", "CANCEL", "REQUEST"]
+        assert [int(message.vevent.sequence.value) for message in sent] == [1, *expected]
+
+    @pytest.mark.parametrize("supplied,expected", [
+        ((1, 1), (2, 3)), ((5, 9), (5, 9))])
+    def test_cancel_reactivate_persists_transmitted_revision(
+            self, monkeypatch, supplied, expected):
+        sent = self._capture(monkeypatch)
+        self.put(self.path, self._source([ALICE], 1), login="jeff:password")
+        for status, sequence, revision in zip(("CANCELLED", "CONFIRMED"), supplied, expected):
+            source = self._source([ALICE], sequence).replace(
+                "END:VEVENT", "STATUS:%s\nEND:VEVENT" % status)
+            self.put(self.path, source, check=204, login="jeff:password")
+            _, stored = self._stored()
+            assert int(stored.vevent.sequence.value) == revision
+            assert int(sent[-1].vevent.sequence.value) == revision
+        assert [message.method.value for message in sent] == ["REQUEST", "CANCEL", "REQUEST"]
+
+    @pytest.mark.parametrize("supplied,expected", [(1, 5), (9, 9)])
+    def test_response_only_save_preserves_revision_floor_without_mail(
+            self, monkeypatch, supplied, expected):
+        sent = self._capture(monkeypatch)
+        old = self._source([("Alice", "alice@example.com", ";PARTSTAT=NEEDS-ACTION")], 5)
+        self.put(self.path, old, login="jeff:password")
+        sent.clear()
+        updated = old.replace("PARTSTAT=NEEDS-ACTION", "PARTSTAT=ACCEPTED").replace(
+            "SEQUENCE:5", "SEQUENCE:%d" % supplied)
+        self.put(self.path, updated, check=204, login="jeff:password")
+        _, stored = self._stored()
+        assert int(stored.vevent.sequence.value) == expected
+        assert stored.vevent.attendee.params["PARTSTAT"] == ["ACCEPTED"]
+        assert sent == []
+
+    def test_client_owned_edit_keeps_higher_supplied_revision(self, monkeypatch):
+        sent = self._capture(monkeypatch)
+        source = self._source([("Alice", "alice@example.com", ";SCHEDULE-AGENT=CLIENT")], 5)
+        self.put(self.path, source, login="jeff:password")
+        updated = source.replace("SEQUENCE:5", "SEQUENCE:9").replace("LOCATION:Home", "LOCATION:Away")
+        self.put(self.path, updated, check=204, login="jeff:password")
+        _, stored = self._stored()
+        assert int(stored.vevent.sequence.value) == 9
+        assert sent == []
+
+    def test_stale_sequence_only_save_keeps_etag_and_sends_nothing(self, monkeypatch):
+        sent = self._capture(monkeypatch)
+        source = self._source([ALICE], 5)
+        self.put(self.path, source, login="jeff:password")
+        old_etag, _ = self._stored()
+        sent.clear()
+        _, headers, _ = self.request("PUT", self.path, source.replace("SEQUENCE:5", "SEQUENCE:1"),
+                                     check=204, login="jeff:password", http_if_match=old_etag)
+        assert "ETag" not in headers
+        new_etag, stored = self._stored()
+        assert new_etag == old_etag
+        assert int(stored.vevent.sequence.value) == 5
+        assert sent == []
+
+    @pytest.mark.parametrize("case", ["disabled", "none", "other-owner", "overrides"])
+    def test_revision_normalization_is_scoped_to_owned_supported_itip_events(self, case):
+        source = self._source([ALICE], 5)
+        if case == "disabled":
+            self.configure({"hook": {"itip_enabled": "False"}})
+        elif case == "none":
+            self.configure({"hook": {"type": "none"}})
+        elif case == "other-owner":
+            source = source.replace("mailto:jeff@example.com", "mailto:other@example.com")
+        else:
+            calendar = vobject.readOne(source)
+            override = vobject.readOne(source).vevent
+            override.add("recurrence-id").value = override.dtstart.value
+            calendar.add(override)
+            source = calendar.serialize()
+        self.put(self.path, source, login="jeff:password")
+        self.put(self.path, source.replace("SEQUENCE:5", "SEQUENCE:1"),
+                 check=204, login="jeff:password")
+        _, stored = self._stored()
+        assert int(stored.vevent.sequence.value) == 1
+
+    def test_exhausted_revision_rejects_edit_before_storage(self, monkeypatch):
+        sent = self._capture(monkeypatch)
+        source = self._source([ALICE], 2147483647)
+        self.put(self.path, source, login="jeff:password")
+        old_etag, _ = self._stored()
+        sent.clear()
+        self.put(self.path, source.replace("LOCATION:Home", "LOCATION:Away"),
+                 check=400, login="jeff:password")
+        new_etag, stored = self._stored()
+        assert new_etag == old_etag
+        assert stored.vevent.location.value == "Home"
+        assert sent == []
+
+    def test_exhausted_revision_delete_sends_no_invalid_message(self, monkeypatch, caplog):
+        sent = self._capture(monkeypatch)
+        self.put(self.path, self._source([ALICE], 2147483647), login="jeff:password")
+        sent.clear()
+        self.delete(self.path, login="jeff:password")
+        self.get(self.path, check=404, login="jeff:password")
+        assert sent == []
+        assert any("CANCEL SEQUENCE exceeds" in message for message in caplog.messages)
+
+    def test_preparation_failure_does_not_commit_or_notify(self, monkeypatch):
+        from radicale.hook.email import Hook
+
+        sent = self._capture(monkeypatch)
+        source = self._source([ALICE], 1)
+        self.put(self.path, source, login="jeff:password")
+        old_etag, _ = self._stored()
+        sent.clear()
+
+        def fail_prepare(hook, notification):
+            raise RuntimeError("test preparation failure")
+
+        monkeypatch.setattr(Hook, "prepare_upload", fail_prepare)
+        self.put(self.path, source.replace("LOCATION:Home", "LOCATION:Away"),
+                 check=500, login="jeff:password")
+        new_etag, stored = self._stored()
+        assert new_etag == old_etag
+        assert stored.vevent.location.value == "Home"
+        assert sent == []
+
+    def test_legacy_hook_without_preparation_method_still_works(self):
+        from types import SimpleNamespace
+        from typing import Any, cast
+
+        notices = []
+        self.application._hook = cast(Any, SimpleNamespace(enabled=True, notify=notices.append))
+        self.put(self.path, self._source([ALICE], 1), login="jeff:password")
+        assert len(notices) == 1
+
+    def test_default_hook_preparation_preserves_input(self):
+        from radicale.hook import (BaseHook, HookNotificationItem,
+                                   HookNotificationItemTypes)
+
+        notice = HookNotificationItem(HookNotificationItemTypes.UPSERT, self.path,
+                                      new_content=self._source([ALICE], 1))
+        assert BaseHook(self.configuration).prepare_upload(notice) is None
+
+    @pytest.mark.parametrize("replacement", ["malformed", "different-uid", "too-large"])
+    def test_invalid_preparation_is_rejected_before_storage(self, monkeypatch, replacement):
+        from radicale.hook.email import Hook
+
+        source = self._source([ALICE], 1)
+        self.put(self.path, source, login="jeff:password")
+        old_etag, _ = self._stored()
+        if replacement == "malformed":
+            result = "not an iCalendar object"
+            expected = 500
+        elif replacement == "different-uid":
+            result = source.replace("UID:pizza-1", "UID:other")
+            expected = 400
+        else:
+            result = source.replace("SUMMARY:Pizza Party", "SUMMARY:" + "x" * 5000)
+            self.configure({"server": {"max_resource_size": "4096"}})
+            expected = 412
+        monkeypatch.setattr(Hook, "prepare_upload", lambda hook, notice: result)
+        self.put(self.path, source, check=expected, login="jeff:password")
+        new_etag, stored = self._stored()
+        assert new_etag == old_etag
+        assert stored.vevent.uid.value == "pizza-1"
+
+    def test_stale_etag_fails_before_preparation(self, monkeypatch):
+        from radicale.hook.email import Hook
+
+        self.put(self.path, self._source([ALICE], 1), login="jeff:password")
+
+        def fail_if_prepared(hook, notice):
+            raise AssertionError("preparation ran before If-Match validation")
+
+        monkeypatch.setattr(Hook, "prepare_upload", fail_if_prepared)
+        self.put(self.path, self._source([ALICE], 2), check=412,
+                 login="jeff:password", http_if_match='"stale"')
 
 
 def _email_config(**kwargs):

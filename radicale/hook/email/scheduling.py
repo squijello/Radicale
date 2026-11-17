@@ -58,7 +58,10 @@ __all__ = [
     "extract_email",
     "parse_event",
     "plan_messages",
+    "prepare_itip_upload",
 ]
+
+MAX_SEQUENCE = 2147483647
 
 
 def extract_email(value: Optional[str]) -> Optional[str]:
@@ -474,6 +477,58 @@ def _strip_scheduling_params(line) -> None:
         params.pop(key, None)
 
 
+def _event_sequence(event) -> int:
+    """Read the non-negative iCalendar integer used for a scheduling revision."""
+    lines = _content_lines(event, "sequence")
+    if not lines:
+        return 0
+    if len(lines) != 1 or not re.fullmatch(r"\+?[0-9]+", str(lines[0].value)):
+        raise ValueError("invalid scheduling SEQUENCE")
+    value = int(lines[0].value)
+    if value > MAX_SEQUENCE:
+        raise ValueError("scheduling SEQUENCE exceeds iCalendar integer range")
+    return value
+
+
+def prepare_itip_upload(old_ics: Optional[str], new_ics: str,
+                        owner_identities: Optional[Sequence[str]]) -> Optional[str]:
+    """Persist a revision floor before sending messages for an owned event.
+
+    A scheduling change advances beyond the stored revision. A response-only
+    or no-op save preserves the greater stored/client revision. The stored
+    value is then used on the wire, so later replies and reinvitations use
+    the same revision space. Unsupported objects are left unchanged.
+    """
+    new_event = parse_event(new_ics)
+    if (new_event is None or _vevent_count(new_ics) != 1 or
+            not check_ownership(new_event.organizer_email, owner_identities)):
+        return None
+    calendar = vobject.readOne(new_ics)
+    new_sequence = _event_sequence(calendar.vevent)
+    if old_ics is None:
+        return None
+    old_event = parse_event(old_ics)
+    if (old_event is None or _vevent_count(old_ics) != 1 or
+            old_event.uid != new_event.uid or
+            old_event.organizer_email != new_event.organizer_email):
+        return None
+    old_sequence = _event_sequence(vobject.readOne(old_ics).vevent)
+    target = max(old_sequence, new_sequence)
+    if plan_messages(old_ics, new_ics, owner_identities=owner_identities):
+        target = max(old_sequence + 1, target)
+    if target > MAX_SEQUENCE:
+        raise ValueError("scheduling SEQUENCE is exhausted; create a meeting with a new UID")
+    if target == new_sequence:
+        return None
+    sequence_lines = _content_lines(calendar.vevent, "sequence")
+    # Newly added SEQUENCE properties use vobject's text serializer.
+    if sequence_lines:
+        sequence_lines[0].value = str(target)
+    else:
+        calendar.vevent.add("sequence").value = str(target)
+    return calendar.serialize()
+
+
 def build_itip_ics(source_ics: str, method: str, recipient_email: str,
                    sequence: Optional[int] = None, cancel_all: bool = True) -> str:
     """Build a per-recipient iTIP calendar object.
@@ -498,9 +553,8 @@ def build_itip_ics(source_ics: str, method: str, recipient_email: str,
     DTSTAMP is set to generation time. For REQUEST, SEQUENCE is
     preserved from the source. For CANCEL, SEQUENCE is
     ``sequence`` if given, otherwise source SEQUENCE + 1. The
-    hook passes max(old, new) + 1 for a removed attendee, so
-    the CANCEL supersedes both event revisions. Live-client
-    behaviour for out-of-order CANCELs is not yet verified.
+    hook supplies the persisted update revision for attendee
+    removal or status cancellation. Deletion uses source + 1.
     """
     if method not in ("REQUEST", "CANCEL"):
         raise ValueError("unsupported iTIP method: %r" % method)
@@ -519,6 +573,7 @@ def build_itip_ics(source_ics: str, method: str, recipient_email: str,
     now = datetime.now(tzutc())
     found_recipient = False
     for event in vevents:
+        source_sequence = _event_sequence(event)
         # DTSTAMP: time this message is generated.
         dtstamp_lines = _content_lines(event, "dtstamp")
         if dtstamp_lines:
@@ -531,19 +586,13 @@ def build_itip_ics(source_ics: str, method: str, recipient_email: str,
             if cancel_all:
                 event.add("status").value = "CANCELLED"
             sequence_lines = _content_lines(event, "sequence")
-            target = sequence
-            if target is None:
-                try:
-                    target = int(sequence_lines[0].value) + 1 if sequence_lines else 1
-                except (TypeError, ValueError):
-                    target = 1
+            target = source_sequence + 1 if sequence is None else sequence
+            if type(target) is not int or not 0 <= target <= MAX_SEQUENCE:
+                raise ValueError("CANCEL SEQUENCE exceeds iCalendar integer range")
             if sequence_lines:
-                sequence_lines[0].value = target
+                sequence_lines[0].value = str(target)
             else:
-                try:
-                    event.add("sequence").value = target
-                except Exception:
-                    pass
+                event.add("sequence").value = str(target)
         # Strip server directives from the organizer line.
         for line in _content_lines(event, "organizer"):
             _strip_scheduling_params(line)

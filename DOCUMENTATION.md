@@ -2277,6 +2277,26 @@ does not send another message.
 Attendees with `SCHEDULE-AGENT=CLIENT` or `SCHEDULE-AGENT=NONE` do not receive
 server-generated messages.
 
+For supported organizer-owned member `PUT`s, the hook maintains a non-decreasing
+stored `SEQUENCE`. An omitted property means revision zero; the hook adds it
+when a later save needs an explicit revision. A change that generates scheduling
+messages stores at least the previous sequence plus one, preserving a higher
+client-supplied value.
+Other saves retain the greater stored/client value without generating extra
+messages. Update notifications use that stored revision, including attendee
+removals and status cancellation. When the hook changes the uploaded revision,
+the `PUT` response omits `ETag`; retrieve the stored object and its strong ETag
+with `GET` before the next conditional edit. A stale `If-Match` still fails
+before preparation or storage.
+
+Deletion sends the previous sequence plus one. No revision tombstone is retained
+after physical deletion: create a new UID when recreating a deleted meeting.
+The iCalendar sequence limit is 2147483647. An update needing a greater revision
+is rejected before storage; deletion at that exhausted limit still deletes the
+object but cannot send a valid cancellation and logs a delivery failure. Start
+a new meeting with a new UID rather than reusing an exhausted revision history.
+Whole-collection imports are outside this member-update scheduling workflow.
+
 Requires the email hook (`type = email`), SMTP configuration, and a non-empty
 `itip_owner_map` or `itip_organizer_is_username = True`. This setting cannot
 be used with `mass_email = True`.

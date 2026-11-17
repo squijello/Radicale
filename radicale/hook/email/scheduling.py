@@ -100,6 +100,43 @@ def _param_of(line, param: str):
     return values[0] if values else None
 
 
+def _recurrence_value(value) -> Tuple:
+    if isinstance(value, (list, tuple)):
+        return tuple(_recurrence_value(part) for part in value)
+    return type(value).__name__, str(value)
+
+
+def _recurrence_properties(event, name: str) -> Tuple:
+    """Compare every recurrence value and its parameters without expansion."""
+    entries = set()
+    for line in _content_lines(event, name):
+        parameters = []
+        for parameter, values in (line.params or {}).items():
+            parameter = parameter.upper()
+            normalized = tuple(str(value).upper() if parameter == "VALUE" else str(value)
+                               for value in values)
+            # DATE-TIME is the default for both date-list properties.
+            if name in ("rdate", "exdate") and (parameter, normalized) == ("VALUE", ("DATE-TIME",)):
+                continue
+            parameters.append((parameter, normalized))
+        params = tuple(sorted(parameters))
+        values = line.value if isinstance(line.value, list) else [line.value]
+        for value in values:
+            if name == "rrule":
+                # RECUR tokens are case-insensitive; rule parts and their
+                # comma-separated choices have no significant ordering.
+                parts = [part.partition("=") for part in str(value).upper().split(";")]
+                normalized_value = tuple(sorted(
+                    (key, separator, tuple(sorted(choices.split(","))))
+                    for key, separator, choices in parts))
+            else:
+                normalized_value = _recurrence_value(value)
+            # Repeated lines, value ordering and duplicate dates describe
+            # the same recurrence set when their parameters agree.
+            entries.add((params, normalized_value))
+    return tuple(sorted(entries, key=repr))
+
+
 @dataclass(frozen=True)
 class AttendeeInfo:
     email: str
@@ -115,11 +152,9 @@ class EventInfo:
     organizer_email: Optional[str]
     organizer_schedule_agent: Optional[str]
     attendees: Dict[str, AttendeeInfo]
-    # Hashable summary of everything except attendees, SEQUENCE and
-    # DTSTAMP. DTSTAMP changes on almost every client save and must
-    # not, by itself, count as an event update; SEQUENCE is preserved
-    # in outgoing messages but is likewise not treated as a content
-    # change here, because clients bump it on attendee-only edits too.
+    # Hashable summary of selected scheduling fields. SEQUENCE and DTSTAMP
+    # alone do not count as content changes; clients may bump them on
+    # response-only saves. Attendee changes are considered by the planner.
     details: Tuple
     status: Optional[str] = None
     recurring: bool = False
@@ -182,9 +217,9 @@ def parse_event(ics: Optional[str]) -> Optional[EventInfo]:
         raw("dtend"),
         raw("duration"),
         raw("status"),
-        raw("rrule"),
-        raw("rdate"),
-        raw("exdate"),
+        _recurrence_properties(event, "rrule"),
+        _recurrence_properties(event, "rdate"),
+        _recurrence_properties(event, "exdate"),
         raw("recurrence-id"),
         organizer_value,
     )

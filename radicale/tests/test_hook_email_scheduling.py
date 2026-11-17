@@ -229,6 +229,72 @@ class TestPlanMessages:
         assert "SCHEDULE-FORCE-SEND" not in itip
 
 
+class TestRecurrenceFingerprint:
+    def _source(self, properties, all_day=False):
+        source = _event([ALICE, BOB])
+        if all_day:
+            source = source.replace("DTSTART:20261113T200000Z", "DTSTART;VALUE=DATE:20261113")
+            source = source.replace("DTEND:20261113T220000Z", "DTEND;VALUE=DATE:20261114")
+        if "RRULE:" not in properties:
+            properties = "RRULE:FREQ=WEEKLY;COUNT=12\n" + properties
+        return source.replace("END:VEVENT", properties + "\nEND:VEVENT")
+
+    @pytest.mark.parametrize("name", ["EXDATE", "RDATE"])
+    @pytest.mark.parametrize("change", ["add", "remove", "replace"])
+    def test_later_date_property_changes_notify_attendees(self, name, change):
+        first = name + ":20261120T200000Z"
+        second = name + ":20261127T200000Z"
+        old = self._source(first + "\n" + second)
+        if change == "add":
+            new = self._source(first + "\n" + second + "\n" + name + ":20261204T200000Z")
+        elif change == "remove":
+            new = self._source(first)
+        else:
+            new = old.replace("20261127T200000Z", "20261204T200000Z")
+        assert _recipients(plan(old, new)) == [
+            ("REQUEST", "alice@example.com", "updated"),
+            ("REQUEST", "bob@example.com", "updated")]
+
+    @pytest.mark.parametrize("name", ["EXDATE", "RDATE"])
+    @pytest.mark.parametrize("value_type", ["DATE", "DATE-TIME"])
+    def test_date_grouping_order_and_duplicates_do_not_notify(self, name, value_type):
+        suffix = "T200000Z" if value_type == "DATE-TIME" else ""
+        first, second = "20261120" + suffix, "20261127" + suffix
+        header = name + ";VALUE=" + value_type + ":"
+        old = self._source(header + first + "\n" + header + second, value_type == "DATE")
+        new = self._source(header + ",".join((second, first, second)), value_type == "DATE")
+        assert plan(old, new) == []
+
+    @pytest.mark.parametrize("name", ["EXDATE", "RDATE"])
+    def test_equivalent_parameter_order_quoting_and_default_type_do_not_notify(self, name):
+        old = self._source(
+            name + ";TZID=Europe/Paris;X-LABEL=CaseSensitive:20261120T200000")
+        new = self._source(
+            name + ';X-LABEL=CaseSensitive;VALUE=DATE-TIME;TZID="Europe/Paris":20261120T200000')
+        assert plan(old, new) == []
+
+    @pytest.mark.parametrize("name", ["EXDATE", "RDATE"])
+    @pytest.mark.parametrize("parameter,old_value,new_value", [
+        ("TZID", "Europe/Paris", "Europe/Berlin"),
+        ("X-LABEL", "Original", "Revised")])
+    def test_later_date_property_parameter_change_notifies(
+            self, name, parameter, old_value, new_value):
+        # Paris and Berlin have the same offset on this date, but the
+        # referenced timezone identifier must remain part of the comparison.
+        old = self._source(
+            name + ":20261120T200000Z\n" + name + ";" + parameter + "=" +
+            old_value + ":20261127T200000")
+        new = old.replace(parameter + "=" + old_value, parameter + "=" + new_value)
+        assert [message.kind for message in plan(old, new)] == ["updated", "updated"]
+
+    def test_rule_part_case_and_list_order_do_not_notify(self):
+        old = self._source("RRULE:FREQ=WEEKLY;COUNT=4;BYDAY=MO,WE")
+        new = self._source("RRULE:byday=WE,MO;freq=WEEKLY;count=4")
+        assert plan(old, new) == []
+        assert [message.kind for message in plan(old, new.replace("count=4", "count=8"))] == [
+            "updated", "updated"]
+
+
 class TestItipMessage:
     def test_request_contains_only_the_recipient_and_the_organizer(self):
         new = _event([ALICE, BOB, CAROL], sequence=3)
@@ -1361,6 +1427,40 @@ class TestRecurringSchedulingPastGuard(BaseTest):
         updated = source.replace("LOCATION:Home", "LOCATION:Elsewhere")
         self.put(self.path, updated, check=204, login="jeff:password")
         assert sent == []
+
+
+class TestRecurrenceFingerprintWiring(BaseTest):
+    def setup_method(self):
+        TestStoredSchedulingRevision.setup_method(self)
+
+    @pytest.mark.parametrize("name", ["EXDATE", "RDATE"])
+    def test_later_date_edit_is_sent_and_regrouping_does_not_bump_revision(self, monkeypatch, name):
+        sent = TestStoredSchedulingRevision._capture(self, monkeypatch)
+        dates = [(self.start + timedelta(days=days)).strftime("%Y%m%dT%H%M%SZ")
+                 for days in (7, 14, 21)]
+        recurrence = "RRULE:FREQ=WEEKLY;COUNT=12\n" + "\n".join(
+            name + ":" + value for value in dates[:2])
+        source = TestStoredSchedulingRevision._source(self, [ALICE], 1).replace(
+            "END:VEVENT", recurrence + "\nEND:VEVENT")
+        self.put(self.path, source, login="jeff:password")
+        assert len(sent) == 1
+        sent.clear()
+        updated = source.replace(dates[1], dates[2])
+        self.put(self.path, updated, check=204, login="jeff:password")
+        assert len(sent) == 1
+        assert sent[0].method.value == "REQUEST"
+        transmitted = [date.strftime("%Y%m%dT%H%M%SZ")
+                       for line in sent[0].vevent.contents[name.lower()] for date in line.value]
+        assert transmitted == [dates[0], dates[2]]
+        assert int(sent[0].vevent.sequence.value) == 2
+        sent.clear()
+        regrouped = updated.replace(
+            name + ":" + dates[0] + "\n" + name + ":" + dates[2],
+            name + ";VALUE=DATE-TIME:" + dates[2] + "," + dates[0])
+        self.put(self.path, regrouped, check=204, login="jeff:password")
+        assert sent == []
+        _, saved = self.get(self.path, login="jeff:password")
+        assert int(vobject.readOne(saved).vevent.sequence.value) == 2
 
 
 def _email_config(**kwargs):

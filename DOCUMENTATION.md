@@ -2311,6 +2311,12 @@ finite, already-ended series can still generate a scheduling message. Unchanged
 saves still send nothing. Ordinary past-event and legacy notification guards
 retain their existing behavior.
 
+Update detection compares selected scheduling fields. For recurrence, it
+compares every `RRULE`, `RDATE` and `EXDATE` value and its parameters, retaining
+timezone and value-type distinctions. Regrouping dates across property lines,
+reordering or repeating the same dates, and reordering rule parts or their
+comma-separated choices do not by themselves cause a scheduling message.
+
 Recurrence overrides with multiple `VEVENT` components are not supported.
 This is not a complete CalDAV scheduling implementation:
 incoming attendee replies and RFC 6638 inbox/outbox handling are not provided.

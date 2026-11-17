@@ -1,6 +1,7 @@
 # Changelog
 
 ## 3.9.3.dev
+* Fix: [hook/email] detect changes across complete recurrence properties without notifying for equivalent date regrouping
 * Fix: [hook/email] keep recurring master updates eligible after the first occurrence ends
 * Fix: [hook/email] persist scheduling revisions before notifications, including events without SEQUENCE, so cancellations and reinvitations stay ordered
 * Fix: [hook/email] distinguish event cancellation from attendee removal, send CANCEL for STATUS:CANCELLED, and omit alarms from cancellation messages

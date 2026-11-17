@@ -186,6 +186,8 @@ SMTP_SSL_VERIFY_MODES: Sequence[str] = (SMTP_SSL_VERIFY_MODE_ENUM.NONE.value,
                                         SMTP_SSL_VERIFY_MODE_ENUM.OPTIONAL.value,
                                         SMTP_SSL_VERIFY_MODE_ENUM.REQUIRED.value)
 
+SMTP_TIMEOUT_SECONDS = 30
+
 
 def read_ics_event(contents: str) -> Optional['Event']:
     """
@@ -983,21 +985,23 @@ class EmailConfig:
 
     def _smtp_send(self, text: str, to_addresses: List[str]) -> bool:
         """Send an already-built MIME message via the configured SMTP server."""
+        server: Optional[smtplib.SMTP] = None
         try:
             if self.security == SMTP_SECURITY_TYPE_ENUM.EMPTY:
                 logger.warning("SMTP security type is empty, raising ValueError.")
                 raise ValueError("SMTP security type cannot be empty. Please specify a valid security type.")
-            elif self.security == SMTP_SECURITY_TYPE_ENUM.NONE:
-                server = smtplib.SMTP(host=self.host, port=self.port)
-            elif self.security == SMTP_SECURITY_TYPE_ENUM.STARTTLS:
+            if self.security == SMTP_SECURITY_TYPE_ENUM.TLS:
                 context = self._build_context()
-                server = smtplib.SMTP(host=self.host, port=self.port)
+                server = smtplib.SMTP_SSL(host=self.host, port=self.port, context=context,
+                                          timeout=SMTP_TIMEOUT_SECONDS)
+            else:
+                server = smtplib.SMTP(host=self.host, port=self.port,
+                                      timeout=SMTP_TIMEOUT_SECONDS)
+            if self.security == SMTP_SECURITY_TYPE_ENUM.STARTTLS:
+                context = self._build_context()
                 server.ehlo()  # Identify self to server
                 server.starttls(context=context)  # Start TLS connection
                 server.ehlo()  # Identify again after starting TLS
-            elif self.security == SMTP_SECURITY_TYPE_ENUM.TLS:
-                context = self._build_context()
-                server = smtplib.SMTP_SSL(host=self.host, port=self.port, context=context)
 
             if self.username and self.password:
                 logger.debug("Logging in to SMTP server with username: %s", self.username)
@@ -1005,17 +1009,29 @@ class EmailConfig:
 
             errors: Dict[str, Tuple[int, bytes]] = server.sendmail(from_addr=self.from_email, to_addrs=to_addresses,
                                                                    msg=text)
-            logger.debug("Email sent successfully to %s", to_addresses)
-            server.quit()
-        except smtplib.SMTPException as e:
-            logger.error("SMTP error occurred: %s", e)
+        except (smtplib.SMTPException, OSError) as e:
+            logger.error("SMTP delivery failed to %s: %s", to_addresses, e)
             return False
+        else:
+            # sendmail already records acceptance or recipient refusal; a
+            # failed QUIT cannot change that result or justify another send.
+            try:
+                server.quit()
+            except (smtplib.SMTPException, OSError) as e:
+                logger.warning("SMTP session shutdown failed: %s", e)
+        finally:
+            if server is not None:
+                try:
+                    server.close()
+                except (smtplib.SMTPException, OSError) as e:
+                    logger.warning("SMTP connection cleanup failed: %s", e)
 
         if errors:
             for email, (code, error) in errors.items():
                 logger.error("Failed to send email to %s: %s (Code: %s)", email, str(error), code)
             return False
 
+        logger.debug("Email sent successfully to %s", to_addresses)
         return True
 
 

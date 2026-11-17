@@ -588,6 +588,9 @@ class TestReplyToEndToEnd(BaseTest):
 
             def quit(self):
                 pass
+
+            def close(self):
+                pass
         monkeypatch.setattr(smtplib, "SMTP", lambda **kwargs: SMTP())
 
     def _future_event(self, attendees, start, *, sequence=1):
@@ -1648,6 +1651,9 @@ class TestOwnerReplyToWiring:
                 return {}
 
             def quit(self):
+                pass
+
+            def close(self):
                 pass
 
         monkeypatch.setattr(smtplib, "SMTP", lambda **kwargs: SMTP())

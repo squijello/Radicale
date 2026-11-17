@@ -1,5 +1,6 @@
 # This file is part of Radicale - CalDAV and CardDAV server
 # Copyright © 2025-2025 Peter Bieringer <pb@bieringer.de>
+# Copyright © 2026-2026 Contributors to Radicale
 #
 # This library is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -22,6 +23,10 @@ Radicale tests related to hook 'email'
 import logging
 import os
 import re
+import smtplib
+import socket
+import ssl
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any, cast
 
@@ -346,8 +351,6 @@ permissions: RrWw""")
         })
 
     def _install_fake_smtp(self, monkeypatch, boom=False):
-        import smtplib
-
         import radicale.hook.email as email_hook
 
         fail = boom
@@ -360,7 +363,9 @@ permissions: RrWw""")
                 self.host = host
                 self.port = port
                 self.context = context
+                self.timeout = kwargs.get("timeout")
                 self.starttls_context = None
+                self.closed = False
                 FakeSMTP.created.append(self)
 
             def ehlo(self):
@@ -381,6 +386,9 @@ permissions: RrWw""")
 
             def quit(self):
                 return (221, b"bye")
+
+            def close(self):
+                self.closed = True
 
         FakeSMTP.created = []
         FakeSMTP.messages = []
@@ -428,6 +436,193 @@ permissions: RrWw""")
             "subject line", "body", [type("A", (), {"email": "janedoe@example.com"})()])
         assert sent is False
 
+    @pytest.mark.parametrize("security", ["none", "starttls", "tls"])
+    def test_smtp_socket_timeout_and_cleanup(self, monkeypatch, security):
+        fake = self._install_fake_smtp(monkeypatch)
+        self._email_hook(security=security)
+        config = cast(Any, self.application._hook).email_config
+
+        assert config._smtp_send("Subject: Test\n\nBody", ["alice@example.com"])
+        assert len(fake.created) == 1
+        assert fake.created[0].timeout == 30
+        assert fake.created[0].closed
+
+    def test_smtp_stalled_greeting_times_out_and_closes_socket(self, monkeypatch):
+        import radicale.hook.email as email_hook
+
+        self._email_hook()
+        config = cast(Any, self.application._hook).email_config
+        monkeypatch.setattr(email_hook, "SMTP_TIMEOUT_SECONDS", 0.05)
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(2)
+            config.host, config.port = listener.getsockname()
+
+            def wait_for_client_close():
+                connection, _ = listener.accept()
+                with connection:
+                    connection.settimeout(2)
+                    # No greeting: the SMTP client must time out and close.
+                    assert connection.recv(1) == b""
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                peer = executor.submit(wait_for_client_close)
+                assert config._smtp_send(
+                    "Subject: Test\n\nBody", ["alice@example.com"]) is False
+                peer.result(timeout=3)
+
+    @pytest.mark.parametrize("security, stage, error", [
+        ("none", "connect", ConnectionRefusedError("connection refused")),
+        ("starttls", "connect", TimeoutError("connection timed out")),
+        ("tls", "connect", ssl.SSLError("TLS handshake failed")),
+        ("starttls", "ehlo", OSError("network unavailable")),
+        ("starttls", "starttls", ssl.SSLError("TLS upgrade failed")),
+        ("none", "login", smtplib.SMTPAuthenticationError(535, b"rejected")),
+        ("none", "sendmail", smtplib.SMTPDataError(451, b"try later")),
+        ("none", "sendmail", ConnectionResetError("connection reset")),
+        ("tls", "sendmail", TimeoutError("DATA timed out")),
+    ])
+    def test_smtp_transport_failure_returns_false_and_closes(
+            self, monkeypatch, caplog, security, stage, error):
+        fake = self._install_fake_smtp(monkeypatch)
+        self._email_hook(security=security)
+        config = cast(Any, self.application._hook).email_config
+        config.username, config.password = "sender", "secret"
+
+        def fail(*args, **kwargs):
+            raise error
+
+        if stage == "connect":
+            constructor = "SMTP_SSL" if security == "tls" else "SMTP"
+            monkeypatch.setattr(smtplib, constructor, fail)
+        else:
+            monkeypatch.setattr(fake, stage, fail)
+
+        assert config._smtp_send("Subject: Test\n\nBody", ["alice@example.com"]) is False
+        assert not fake.messages
+        assert len(fake.created) == (0 if stage == "connect" else 1)
+        assert all(client.closed for client in fake.created)
+        assert any("SMTP delivery failed" in message for message in caplog.messages)
+
+    @pytest.mark.parametrize("error", [
+        smtplib.SMTPServerDisconnected("QUIT disconnected"),
+        OSError("QUIT connection reset"),
+    ])
+    def test_smtp_quit_failure_preserves_acceptance(self, monkeypatch, caplog, error):
+        fake = self._install_fake_smtp(monkeypatch)
+        self._email_hook()
+
+        def fail_quit(client):
+            raise error
+
+        monkeypatch.setattr(fake, "quit", fail_quit)
+        config = cast(Any, self.application._hook).email_config
+        assert config._smtp_send("Subject: Test\n\nBody", ["alice@example.com"]) is True
+        assert len(fake.messages) == 1
+        assert fake.created[0].closed
+        assert any("SMTP session shutdown failed" in message for message in caplog.messages)
+
+    @pytest.mark.parametrize("delivery_fails", [False, True])
+    def test_smtp_close_failure_does_not_mask_delivery_result(
+            self, monkeypatch, caplog, delivery_fails):
+        fake = self._install_fake_smtp(monkeypatch, boom=delivery_fails)
+        self._email_hook()
+        close_attempts = []
+
+        def fail_close(client):
+            close_attempts.append(client)
+            raise OSError("close failed")
+
+        monkeypatch.setattr(fake, "close", fail_close)
+        config = cast(Any, self.application._hook).email_config
+        assert config._smtp_send("Subject: Test\n\nBody", ["alice@example.com"]) is not delivery_fails
+        assert close_attempts == fake.created
+        assert len(close_attempts) == 1
+        assert any("SMTP connection cleanup failed" in message for message in caplog.messages)
+
+    def test_smtp_unexpected_error_propagates_after_cleanup(self, monkeypatch):
+        fake = self._install_fake_smtp(monkeypatch)
+        self._email_hook()
+
+        def unexpected_error(*args, **kwargs):
+            raise RuntimeError("programming error")
+
+        monkeypatch.setattr(fake, "sendmail", unexpected_error)
+        config = cast(Any, self.application._hook).email_config
+        with pytest.raises(RuntimeError, match="programming error"):
+            config._smtp_send("Subject: Test\n\nBody", ["alice@example.com"])
+        assert len(fake.created) == 1
+        assert fake.created[0].closed
+
+    def test_smtp_partial_refusal_reports_failure_and_closes(self, monkeypatch, caplog):
+        fake = self._install_fake_smtp(monkeypatch)
+        self._email_hook()
+
+        def partial_refusal(*args, **kwargs):
+            return {"bob@example.com": (550, b"recipient rejected")}
+
+        monkeypatch.setattr(fake, "sendmail", partial_refusal)
+        config = cast(Any, self.application._hook).email_config
+        assert config._smtp_send(
+            "Subject: Test\n\nBody", ["alice@example.com", "bob@example.com"]) is False
+        assert fake.created[0].closed
+        assert any("Failed to send email to bob@example.com" in message
+                   for message in caplog.messages)
+        assert not any("Email sent successfully" in message for message in caplog.messages)
+
+    @pytest.mark.parametrize("itip_enabled", [False, True])
+    @pytest.mark.parametrize("operation", ["create", "update", "delete"])
+    @pytest.mark.parametrize("stage", ["connect", "sendmail"])
+    def test_smtp_failure_preserves_calendar_write_and_later_recipient(
+            self, monkeypatch, caplog, itip_enabled, operation, stage):
+        fake = self._install_fake_smtp(monkeypatch)
+        self._email_hook(dryrun="True")
+        self.configure({"auth": {"type": "none"}, "hook": {
+            "itip_enabled": itip_enabled,
+            "itip_owner_map": '{"jeff": "unclesam@example.com"}',
+            "from_email": "unclesam@example.com"}})
+        self.mkcalendar("/calendar.ics/", login="jeff:password")
+        path = "/calendar.ics/event1.ics"
+        source = self._future_event().replace("END:VEVENT", "SEQUENCE:0\nEND:VEVENT")
+        if operation != "create":
+            self.put(path, source, login="jeff:password")
+        self.configure({"hook": {"dryrun": "False"}})
+        attempts = []
+        original_sendmail = fake.sendmail
+
+        def connect(*args, **kwargs):
+            attempts.append("connect")
+            if len(attempts) == 1:
+                raise ConnectionRefusedError("first connection refused")
+            return fake(*args, **kwargs)
+
+        def sendmail(client, from_addr, to_addrs, msg):
+            attempts.append(list(to_addrs))
+            if len(attempts) == 1:
+                raise TimeoutError("first delivery timed out")
+            return original_sendmail(client, from_addr, to_addrs, msg)
+
+        if stage == "connect":
+            monkeypatch.setattr(smtplib, "SMTP", connect)
+        else:
+            monkeypatch.setattr(fake, "sendmail", sendmail)
+
+        if operation == "delete":
+            self.request("DELETE", path, check=200, login="jeff:password")
+            self.request("GET", path, check=404, login="jeff:password")
+        else:
+            source = source.replace("SUMMARY:Event", "SUMMARY:Saved event")
+            self.put(path, source, check=201 if operation == "create" else 204,
+                     login="jeff:password")
+            _, _, stored = self.request("GET", path, check=200, login="jeff:password")
+            assert "SUMMARY:Saved event" in stored
+        assert len(attempts) == 2
+        assert len(fake.messages) == 1
+        assert fake.messages[0][1] == ["johndoe@example.com"]
+        assert all(client.closed for client in fake.created)
+        assert any("SMTP delivery failed" in message for message in caplog.messages)
+
     def test_empty_smtp_security_raises(self) -> None:
         self._email_hook(security="")
         with pytest.raises(ValueError, match="SMTP security type cannot be empty"):
@@ -435,8 +630,6 @@ permissions: RrWw""")
                 "subject line", "body", [type("A", (), {"email": "janedoe@example.com"})()])
 
     def test_starttls_and_tls_verify_mode(self, monkeypatch) -> None:
-        import ssl
-
         expected = {
             "REQUIRED": ssl.CERT_REQUIRED,
             "OPTIONAL": ssl.CERT_OPTIONAL,

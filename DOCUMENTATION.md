@@ -2174,6 +2174,16 @@ _(>= 3.5.5)_
 
 Address of SMTP server to connect to.
 
+SMTP socket operations use a 30-second timeout. This applies to each blocking
+socket operation, not the total notification run. Notifications are sent
+synchronously, so multiple recipients can keep the calendar write lock held
+for longer than 30 seconds. Expected SMTP and network failures are logged;
+they do not change the successful result of an already committed calendar
+write, and individual delivery continues with the remaining recipients.
+Connections are closed after each attempt. Failure to close the SMTP session
+cleanly after message acceptance does not turn an accepted message into a
+delivery failure.
+
 Default: (unset)
 
 ##### smtp_port

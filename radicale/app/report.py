@@ -8,6 +8,7 @@
 # Copyright © 2024-2025 Georgiy <metallerok@gmail.com>
 # Copyright © 2024-2026 Peter Bieringer <pb@bieringer.de>
 # Copyright © 2025-2025 David Greaves <david@dgreaves.com>
+# Copyright © 2026-2026 Contributors to Radicale
 #
 # This library is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -477,6 +478,7 @@ def xml_report(base_prefix: str, path: str, xml_request: Optional[ET.Element],
 
         found_props = []
         not_found_props = []
+        expanded_data: Optional[Tuple[Optional[str], int]] = None
 
         for prop in props:
             element = ET.Element(prop.tag)
@@ -490,51 +492,50 @@ def xml_report(base_prefix: str, path: str, xml_request: Optional[ET.Element],
                 element.text = item.serialize()
 
                 if (expand is not None) and item.component_name == 'VEVENT':
-                    starts = expand.get('start')
-                    ends = expand.get('end')
+                    # Several properties may need the same expansion. Cache
+                    # its text (including an empty result), not a tagged XML
+                    # element, and count each item's occurrences only once.
+                    if expanded_data is None:
+                        starts = expand.get('start')
+                        ends = expand.get('end')
 
-                    if (starts is None) or (ends is None):
-                        return client.FORBIDDEN, \
-                            xmlutils.webdav_error("C:expand")
+                        if (starts is None) or (ends is None):
+                            return client.FORBIDDEN, \
+                                xmlutils.webdav_error("C:expand")
 
-                    start = datetime.datetime.strptime(
-                        starts, DT_FORMAT_TIMESTAMP
-                    ).replace(tzinfo=datetime.timezone.utc)
-                    end = datetime.datetime.strptime(
-                        ends, DT_FORMAT_TIMESTAMP
-                    ).replace(tzinfo=datetime.timezone.utc)
+                        start = datetime.datetime.strptime(
+                            starts, DT_FORMAT_TIMESTAMP
+                        ).replace(tzinfo=datetime.timezone.utc)
+                        end = datetime.datetime.strptime(
+                            ends, DT_FORMAT_TIMESTAMP
+                        ).replace(tzinfo=datetime.timezone.utc)
 
-                    time_range_start = None
-                    time_range_end = None
+                        time_range_start = None
+                        time_range_end = None
 
-                    if time_range_element is not None:
-                        time_range_start, time_range_end = radicale_filter.parse_time_range(time_range_element)
+                        if time_range_element is not None:
+                            time_range_start, time_range_end = radicale_filter.parse_time_range(time_range_element)
 
-                    (expanded_element, n_vev) = _expand(
-                        element=element, item=copy.copy(item),
-                        start=start, end=end,
-                        time_range_start=time_range_start, time_range_end=time_range_end,
-                        max_occurrence=max_occurrence,
-                    )
+                        expanded_element, n_vev = _expand(
+                            element=element, item=item,
+                            start=start, end=end,
+                            time_range_start=time_range_start, time_range_end=time_range_end,
+                            max_occurrence=max_occurrence,
+                        )
+                        expanded_data = expanded_element.text, n_vev
+                        n_vevents += n_vev
+
+                    expanded_text, n_vev = expanded_data
 
                     if n_vev == 0:
                         logger.debug("No VEVENTs found after expansion for %r, skipping", item.href)
                         continue
 
-                    n_vevents += n_vev
                     if prop.tag == xmlutils.make_clark("D:getetag"):
-                        if n_vev > 0:
-                            if logger.isEnabledFor(logging.DEBUG):
-                                logger.trace("REPORT/xml_report: getetag/expanded element")
-                            element.text = item.etag
-                            found_props.append(element)
-                        else:
-                            if logger.isEnabledFor(logging.DEBUG):
-                                logger.trace("REPORT/xml_report: getetag/no expanded element")
+                        element.text = item.etag
                     else:
-                        if logger.isEnabledFor(logging.DEBUG):
-                            logger.trace("REPORT/xml_report: default")
-                        found_props.append(expanded_element)
+                        element.text = expanded_text
+                    found_props.append(element)
                 else:
                     if prop.tag == xmlutils.make_clark("D:getetag"):
                         element.text = item.etag
@@ -574,7 +575,11 @@ def _expand(
         time_range_end: Optional[datetime.datetime] = None,
         max_occurrence: int = 0,
 ) -> Tuple[ET.Element, int]:
-    vevent_component: vobject.base.Component = copy.copy(item.vobject_item)
+    # Expansion rewrites temporal fields and recurrence properties. Filtering
+    # may already have parsed this Item, so neither it nor its children may
+    # share mutable components with the expanded response.
+    source = item.vobject_item
+    vevent_component: vobject.base.Component = source.duplicate(source)
     logger.debug("Expanding event %s", item.href)
     if logger.isEnabledFor(logging.DEBUG):
         logger.trace("Expand range: %s to %s", start, end)

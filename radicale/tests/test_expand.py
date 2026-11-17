@@ -4,6 +4,7 @@
 # Copyright © 2024 Pieter Hijma <pieterhijma@users.noreply.github.com>
 # Copyright © 2025 David Greaves <david@dgreaves.com>
 # Copyright © 2025 Peter Bieringer <pb@bieringer.de>
+# Copyright © 2026-2026 Contributors to Radicale
 #
 # This library is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -26,6 +27,9 @@ Radicale tests with expand requests.
 import os
 from typing import ClassVar, List, Optional
 from xml.etree import ElementTree
+
+import pytest
+import vobject
 
 from radicale.log import logger
 from radicale.tests import BaseTest
@@ -616,6 +620,136 @@ permissions: RrWw""")
         status, event2_calendar_data = responses["/test/event2.ics"]["C:calendar-data"]
         assert event2_calendar_data.text
         assert "UID:c6be8b2c-3d72-453c-b698-4f25cdf1569e" in event2_calendar_data.text
+
+    @staticmethod
+    def _combined_expand_source(kind="utc", uid="combined-expand"):
+        lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Test//EN",
+                 "BEGIN:VEVENT", "UID:" + uid, "DTSTAMP:20261117T120000Z",
+                 "DTSTART:20270815T100000Z", "DTEND:20270815T110000Z",
+                 "RRULE:FREQ=DAILY;COUNT=2", "END:VEVENT", "END:VCALENDAR"]
+        source = "\r\n".join(lines) + "\r\n"
+        if kind == "all-day":
+            source = source.replace("DTSTART:20270815T100000Z", "DTSTART;VALUE=DATE:20270815")
+            source = source.replace("DTEND:20270815T110000Z", "DTEND;VALUE=DATE:20270816")
+        elif kind == "timezone":
+            source = source.replace("DTSTART:20270815T100000Z", "DTSTART;TZID=Europe/Paris:20270815T120000")
+            source = source.replace("DTEND:20270815T110000Z", "DTEND;TZID=Europe/Paris:20270815T130000")
+        elif kind == "override":
+            override = "\r\n".join([
+                "BEGIN:VEVENT", "UID:" + uid, "DTSTAMP:20261117T120000Z",
+                "RECURRENCE-ID:20270816T100000Z", "DTSTART:20270816T120000Z",
+                "DTEND:20270816T130000Z", "END:VEVENT"])
+            source = source.replace("END:VCALENDAR", override + "\r\nEND:VCALENDAR")
+        return source
+
+    @staticmethod
+    def _combined_expand_query(data_first=False, materialize=True, empty=False):
+        start = "20270820T000000Z" if empty else "20270815T000000Z"
+        end = "20270823T000000Z" if empty else "20270818T000000Z"
+        data = '<C:calendar-data><C:expand start="%s" end="%s"/></C:calendar-data>' % (start, end)
+        props = data + "<D:getetag/>" if data_first else "<D:getetag/>" + data
+        uid_filter = ('<C:prop-filter name="UID"><C:text-match>combined-expand</C:text-match>'
+                      '</C:prop-filter>') if materialize else ""
+        return '''<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+          <D:prop>%s</D:prop><C:filter><C:comp-filter name="VCALENDAR">
+            <C:comp-filter name="VEVENT">
+              <C:time-range start="20270815T000000Z" end="20270818T000000Z"/>
+              %s
+            </C:comp-filter>
+          </C:comp-filter></C:filter></C:calendar-query>''' % (props, uid_filter)
+
+    @pytest.mark.parametrize("data_first", [False, True])
+    @pytest.mark.parametrize("kind", ["utc", "all-day", "timezone", "override"])
+    def test_report_combined_expand_properties_preserve_item_and_etag(self, monkeypatch, data_first, kind):
+        from radicale.app import report as report_module
+
+        self.mkcalendar("/test/")
+        path = "/test/combined.ics"
+        self.put(path, self._combined_expand_source(kind))
+        _, before_headers, before = self.request("GET", path, check=200)
+        original_expand = report_module._expand
+        calls = []
+
+        def expand(**kwargs):
+            calls.append(kwargs["item"].href)
+            return original_expand(**kwargs)
+
+        monkeypatch.setattr(report_module, "_expand", expand)
+        query = self._combined_expand_query(data_first)
+        for attempt in range(2):
+            _, responses = self.report("/test/", query)
+            response = responses[path]
+            assert isinstance(response, dict)
+            status, etag = response["D:getetag"]
+            assert status == 200 and etag.text == before_headers["ETag"]
+            status, data = response["C:calendar-data"]
+            assert status == 200 and data.text
+            expanded = vobject.readOne(data.text)
+            starts = [event.dtstart.value.strftime("%Y%m%d" if kind == "all-day" else "%Y%m%dT%H%M%SZ")
+                      for event in expanded.vevent_list]
+            expected = ["20270815T100000Z", "20270816T120000Z" if kind == "override" else "20270816T100000Z"]
+            if kind == "all-day":
+                expected = ["20270815", "20270816"]
+            assert starts == expected
+            assert len(calls) == attempt + 1
+        _, after_headers, after = self.request("GET", path, check=200)
+        assert after == before and after_headers["ETag"] == before_headers["ETag"]
+
+    @pytest.mark.parametrize("kind", ["utc", "timezone", "override"])
+    def test_expand_does_not_mutate_a_materialized_item(self, kind):
+        from datetime import datetime, timezone
+
+        from radicale.app.report import _expand
+        from radicale.item import Item
+
+        item = Item(collection_path="test", vobject_item=vobject.readOne(self._combined_expand_source(kind)))
+        before = item.vobject_item.serialize()
+        results = []
+        for _ in range(2):
+            element, count = _expand(ElementTree.Element("calendar-data"), item,
+                                     datetime(2027, 8, 15, tzinfo=timezone.utc),
+                                     datetime(2027, 8, 18, tzinfo=timezone.utc))
+            assert count == 2
+            results.append(element.text)
+            assert item.vobject_item.serialize() == before
+        assert results[0] == results[1]
+
+    @pytest.mark.parametrize("data_first", [False, True])
+    def test_report_combined_expand_counts_instances_once(self, data_first):
+        self.configure({"reporting": {"max_expand_occurrence": "3"}})
+        self.mkcalendar("/test/")
+        self.put("/test/combined.ics", self._combined_expand_source())
+        _, responses = self.report("/test/", self._combined_expand_query(data_first, materialize=False))
+        assert list(responses) == ["/test/combined.ics"]
+
+    @pytest.mark.parametrize("aggregate", [False, True])
+    def test_report_combined_expand_keeps_actual_occurrence_limits(self, aggregate):
+        self.configure({"reporting": {"max_expand_occurrence": "3"}})
+        self.mkcalendar("/test/")
+        source = self._combined_expand_source()
+        if not aggregate:
+            source = source.replace("COUNT=2", "COUNT=4")
+        self.put("/test/combined.ics", source)
+        if aggregate:
+            self.put("/test/second.ics", self._combined_expand_source(uid="second-expand"))
+        self.report("/test/", self._combined_expand_query(materialize=False), check=400)
+
+    def test_report_combined_expand_caches_empty_results(self, monkeypatch):
+        from radicale.app import report as report_module
+
+        self.mkcalendar("/test/")
+        self.put("/test/combined.ics", self._combined_expand_source())
+        original_expand = report_module._expand
+        calls = []
+
+        def expand(**kwargs):
+            calls.append(kwargs["item"].href)
+            return original_expand(**kwargs)
+
+        monkeypatch.setattr(report_module, "_expand", expand)
+        _, responses = self.report("/test/", self._combined_expand_query(empty=True))
+        assert not responses
+        assert len(calls) == 1
 
     def test_report_getetag_expand_filter(self) -> None:
         """Test getetag with time-range filter and expand (example from #1880)."""

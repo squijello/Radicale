@@ -118,6 +118,7 @@ class EventInfo:
     # in outgoing messages but is likewise not treated as a content
     # change here, because clients bump it on attendee-only edits too.
     details: Tuple
+    status: Optional[str] = None
 
 
 def parse_event(ics: Optional[str]) -> Optional[EventInfo]:
@@ -189,6 +190,7 @@ def parse_event(ics: Optional[str]) -> Optional[EventInfo]:
         organizer_email=extract_email(organizer_value),
         organizer_schedule_agent=_first_param(event, "organizer", "SCHEDULE-AGENT"),
         attendees=attendees,
+        status=raw("status"),
         details=details,
     )
 
@@ -199,7 +201,7 @@ class PlannedMessage:
     method: str  # "REQUEST" or "CANCEL"
     recipient_email: str
     recipient_name: Optional[str]
-    # "created", "added", "removed", "updated" or "deleted".
+    # "created", "added", "removed", "updated", "cancelled" or "deleted".
     kind: str
 
 
@@ -392,8 +394,8 @@ def plan_messages(old_ics: Optional[str], new_ics: Optional[str],
     ``old_ics`` is the event before the change (None for a new
     event), ``new_ics`` is the event after it. For
     ``deleted=True`` only ``old_ics`` is used and every eligible
-    attendee gets a CANCEL. An empty list means nothing is sent:
-    a repeated save, an unproved organizer, an unparseable
+    attendee of an active event gets a CANCEL. An empty list means
+    nothing is sent: a repeated save, an unproved organizer, an unparseable
     previous event, or a rejected multi-VEVENT object. The
     caller logs the unproved-ownership and unparseable cases.
     """
@@ -406,6 +408,8 @@ def plan_messages(old_ics: Optional[str], new_ics: Optional[str],
             return []
         if not check_ownership(old_event.organizer_email, owner_identities):
             return []
+        if (old_event.status or "").upper() == "CANCELLED":
+            return []
         return [PlannedMessage("CANCEL", a.email, a.name, "deleted")
                 for a in old_event.attendees.values()
                 if _eligible(old_event, a)]
@@ -415,6 +419,8 @@ def plan_messages(old_ics: Optional[str], new_ics: Optional[str],
         return []
     if old_ics is None:
         if _vevent_count(new_ics) > 1:
+            return []
+        if (new_event.status or "").upper() == "CANCELLED":
             return []
         return [PlannedMessage("REQUEST", a.email, a.name, "created")
                 for a in new_event.attendees.values()
@@ -431,6 +437,20 @@ def plan_messages(old_ics: Optional[str], new_ics: Optional[str],
     # Multi-VEVENT objects are rejected, not approximated.
     if _vevent_count(old_ics) > 1 or _vevent_count(new_ics) > 1:
         return []
+    old_cancelled = (old_event.status or "").upper() == "CANCELLED"
+    if (new_event.status or "").upper() == "CANCELLED":
+        if old_cancelled:
+            return []
+        # Honor retained attendees' current delivery directives. Removed
+        # attendees use their previous directives; newly added attendees
+        # never had an invitation to cancel.
+        return [PlannedMessage("CANCEL", a.email, a.name, "cancelled")
+                for a in old_event.attendees.values()
+                if _eligible(new_event, new_event.attendees.get(a.email, a))]
+    if old_cancelled:
+        return [PlannedMessage("REQUEST", a.email, a.name,
+                               "updated" if a.email in old_event.attendees else "added")
+                for a in new_event.attendees.values() if _eligible(new_event, a)]
     planned: List[PlannedMessage] = []
     for email, attendee in new_event.attendees.items():
         if email not in old_event.attendees and _eligible(new_event, attendee):
@@ -455,7 +475,7 @@ def _strip_scheduling_params(line) -> None:
 
 
 def build_itip_ics(source_ics: str, method: str, recipient_email: str,
-                   sequence: Optional[int] = None) -> str:
+                   sequence: Optional[int] = None, cancel_all: bool = True) -> str:
     """Build a per-recipient iTIP calendar object.
 
     ``source_ics`` is the new event for REQUEST and the old event
@@ -464,6 +484,11 @@ def build_itip_ics(source_ics: str, method: str, recipient_email: str,
     one ATTENDEE (the recipient). ``SCHEDULE-AGENT`` and
     ``SCHEDULE-FORCE-SEND`` are stripped from ORGANIZER and
     ATTENDEE lines.
+
+    For CANCEL, ``cancel_all=True`` cancels the event and sets
+    STATUS:CANCELLED. Set it to False when uninviting only the
+    recipient; that cancellation omits STATUS. Both scopes omit
+    VALARM components, as required by RFC 5546 section 3.2.5.
 
     A multi-VEVENT source raises ValueError, matching the
     planner's rejection; the builder enforces the restriction
@@ -501,6 +526,10 @@ def build_itip_ics(source_ics: str, method: str, recipient_email: str,
         # SEQUENCE: preserve for REQUEST; for CANCEL use the
         # explicit sequence if given, otherwise source + 1.
         if method == "CANCEL":
+            event.contents.pop("status", None)
+            event.contents.pop("valarm", None)
+            if cancel_all:
+                event.add("status").value = "CANCELLED"
             sequence_lines = _content_lines(event, "sequence")
             target = sequence
             if target is None:

@@ -2265,8 +2265,15 @@ Each outgoing calendar message contains only the recipient's attendee entry.
 New events send invitations to eligible attendees. Adding an attendee sends
 an invitation only to the new attendee when other event details are unchanged.
 Removing an attendee sends a cancellation to the removed attendee; changing
-event details sends updates to existing attendees; deleting an event sends
-cancellations. Saving an event without changes does not send another message.
+event details sends updates to existing attendees. Deleting an event or changing
+its status to `CANCELLED` sends cancellations to its previous attendees, subject
+to their current delivery directives (previous directives for removed attendees).
+An event imported with cancelled status does not send invitations. Saving or
+deleting an already cancelled event does not repeat the cancellation; restoring
+an active status sends invitations to its current eligible attendees. Whole-event
+cancellations include `STATUS:CANCELLED`; individual attendee removals omit
+`STATUS`. Neither cancellation includes alarms. Saving an event without changes
+does not send another message.
 Attendees with `SCHEDULE-AGENT=CLIENT` or `SCHEDULE-AGENT=NONE` do not receive
 server-generated messages.
 

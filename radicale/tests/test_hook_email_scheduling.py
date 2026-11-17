@@ -26,6 +26,9 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Tuple
 
+import pytest
+import vobject
+
 from radicale.hook.email.scheduling import (build_itip_ics, build_itip_message,
                                             check_ownership, plan_messages)
 from radicale.tests import BaseTest
@@ -116,6 +119,54 @@ class TestPlanMessages:
             ("CANCEL", "alice@example.com", "deleted"),
             ("CANCEL", "bob@example.com", "deleted")]
 
+    def test_status_cancellation_notifies_previous_eligible_attendees(self):
+        client = ("Carol", "carol@example.com", ";SCHEDULE-AGENT=CLIENT")
+        old = _event([ALICE, BOB, client])
+        new = _event([BOB, client, ("Dan", "dan@example.com", "")])
+        new = new.replace("END:VEVENT", "STATUS:CANCELLED\nEND:VEVENT")
+        assert _recipients(plan(old, new)) == [
+            ("CANCEL", "alice@example.com", "cancelled"),
+            ("CANCEL", "bob@example.com", "cancelled")]
+        assert plan(old, new, owner=[]) == []
+
+    @pytest.mark.parametrize("old_agent,new_agent,expected", [
+        ("", ";SCHEDULE-AGENT=CLIENT", []),
+        ("", ";SCHEDULE-AGENT=NONE", []),
+        (";SCHEDULE-AGENT=CLIENT", ";SCHEDULE-AGENT=SERVER",
+         [("CANCEL", "alice@example.com", "cancelled")]),
+        (";SCHEDULE-AGENT=NONE", "",
+         [("CANCEL", "alice@example.com", "cancelled")]),
+    ])
+    def test_status_cancellation_uses_retained_attendee_current_agent(
+            self, old_agent, new_agent, expected):
+        old = _event([("Alice", "alice@example.com", old_agent)])
+        new = _event([("Alice", "alice@example.com", new_agent)]).replace(
+            "END:VEVENT", "STATUS:CANCELLED\nEND:VEVENT")
+        assert _recipients(plan(old, new)) == expected
+
+    def test_status_cancellation_uses_removed_attendee_previous_agent(self):
+        old = _event([ALICE, ("Bob", "bob@example.com", ";SCHEDULE-AGENT=CLIENT")])
+        new = _event([]).replace("END:VEVENT", "STATUS:CANCELLED\nEND:VEVENT")
+        assert _recipients(plan(old, new)) == [
+            ("CANCEL", "alice@example.com", "cancelled")]
+
+    def test_cancelled_event_does_not_send_new_invitations_or_repeat_cancel(self):
+        cancelled = _event([ALICE, BOB]).replace(
+            "END:VEVENT", "STATUS:CANCELLED\nEND:VEVENT")
+        assert plan(None, cancelled) == []
+        assert plan(cancelled, cancelled) == []
+        edited = cancelled.replace("SUMMARY:Pizza Party", "SUMMARY:Cancelled party")
+        assert plan(cancelled, edited) == []
+        assert plan(cancelled, None, deleted=True) == []
+
+    def test_reactivated_event_requests_current_attendees_only(self):
+        old = _event([ALICE, BOB]).replace(
+            "END:VEVENT", "STATUS:CANCELLED\nEND:VEVENT")
+        new = _event([BOB, CAROL])
+        assert _recipients(plan(old, new)) == [
+            ("REQUEST", "bob@example.com", "updated"),
+            ("REQUEST", "carol@example.com", "added")]
+
     def test_schedule_agent_client_attendee_is_skipped(self):
         old = _event([ALICE])
         client_carol = ("Carol", "carol@example.com", ";SCHEDULE-AGENT=CLIENT")
@@ -194,6 +245,26 @@ class TestItipMessage:
         itip = build_itip_ics(old, "CANCEL", "carol@example.com")
         assert "METHOD:CANCEL" in itip
         assert "carol@example.com" in itip
+
+    @pytest.mark.parametrize("cancel_all", [False, True])
+    @pytest.mark.parametrize("recurring", [False, True])
+    def test_cancel_scope_sets_status_and_omits_alarms(self, cancel_all, recurring):
+        source = _event([ALICE, BOB])
+        details = ("STATUS:CONFIRMED\nBEGIN:VALARM\nACTION:DISPLAY\n"
+                   "DESCRIPTION:Reminder\nTRIGGER:-PT15M\nEND:VALARM\n")
+        if recurring:
+            details += "RRULE:FREQ=WEEKLY;COUNT=4\n"
+        source = source.replace("END:VEVENT", details + "END:VEVENT")
+        wire = vobject.readOne(build_itip_ics(
+            source, "CANCEL", "alice@example.com", cancel_all=cancel_all))
+        assert wire.method.value == "CANCEL"
+        assert "valarm" not in wire.vevent.contents
+        assert ("rrule" in wire.vevent.contents) == recurring
+        assert len(wire.vevent.attendee_list) == 1
+        if cancel_all:
+            assert [line.value for line in wire.vevent.status_list] == ["CANCELLED"]
+        else:
+            assert "status" not in wire.vevent.contents
 
     def test_itip_email_carries_text_calendar_with_method(self):
         new = _event([ALICE, CAROL])
@@ -307,6 +378,62 @@ class TestHookWiring(BaseTest):
             "Hook 'email': DRY-RUN send_scheduling_email / to_addresses=['bob@example.com']",
             "Hook 'email': DRY-RUN send_scheduling_email / to_addresses=['carol@example.com']",
         ]
+
+    @pytest.mark.parametrize("operation", ["remove", "cancel", "delete"])
+    @pytest.mark.parametrize("recurring", [False, True])
+    def test_cancellation_wire_scope(self, monkeypatch, operation, recurring):
+        from email import message_from_string, policy
+
+        from radicale.hook.email import EmailConfig
+
+        sent = []
+
+        def capture_smtp(config, text, to_addresses):
+            message = message_from_string(text, policy=policy.default)
+            calendar = [part for part in message.walk()
+                        if part.get_content_type() == "text/calendar"]
+            assert len(calendar) == 1
+            wire = vobject.readOne(calendar[0].get_payload(decode=True).decode("utf-8"))
+            sent.append((to_addresses, calendar[0].get_param("method"), wire))
+            return True
+
+        monkeypatch.setattr(EmailConfig, "_smtp_send", capture_smtp)
+        self.configure({"hook": {"dryrun": "False"}})
+        self.mkcalendar("/calendar.ics/", login="jeff:password")
+        path = "/calendar.ics/event1.ics"
+        source = self._future_event([ALICE, BOB], datetime.now() + timedelta(days=1))
+        details = ("STATUS:CONFIRMED\nBEGIN:VALARM\nACTION:DISPLAY\n"
+                   "DESCRIPTION:Reminder\nTRIGGER:-PT15M\nEND:VALARM\n")
+        if recurring:
+            details += "RRULE:FREQ=WEEKLY;COUNT=4\n"
+        source = source.replace("END:VEVENT", details + "END:VEVENT")
+        self.put(path, source, login="jeff:password")
+        assert len(sent) == 2
+        sent.clear()
+        if operation == "remove":
+            updated = source.replace("ATTENDEE;CN=Alice:mailto:alice@example.com\n", "")
+            self.put(path, updated, check=204, login="jeff:password")
+            assert [recipients for recipients, _, _ in sent] == [["alice@example.com"]]
+        elif operation == "cancel":
+            updated = source.replace("STATUS:CONFIRMED", "STATUS:CANCELLED")
+            self.put(path, updated, check=204, login="jeff:password")
+        else:
+            self.delete(path, login="jeff:password")
+        if operation != "remove":
+            assert [recipients for recipients, _, _ in sent] == [
+                ["alice@example.com"], ["bob@example.com"]]
+        for _, method, wire in sent:
+            assert method == wire.method.value == "CANCEL"
+            assert "valarm" not in wire.vevent.contents
+            assert ("rrule" in wire.vevent.contents) == recurring
+            if operation == "remove":
+                assert "status" not in wire.vevent.contents
+            else:
+                assert wire.vevent.status.value == "CANCELLED"
+        if operation == "cancel":
+            sent.clear()
+            self.put(path, updated, check=204, login="jeff:password")
+            assert sent == []
 
 
 class TestReplyToEndToEnd(BaseTest):

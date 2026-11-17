@@ -842,7 +842,7 @@ class EmailConfig:
         """
         if planned.kind in ("created", "added"):
             template = self.new_or_added_to_event_template
-        elif planned.kind in ("removed", "deleted"):
+        elif planned.kind in ("removed", "cancelled", "deleted"):
             template = self.deleted_or_removed_from_event_template
         else:
             template = self.updated_event_template
@@ -855,7 +855,7 @@ class EmailConfig:
                                          mass_email=False, attendee=attendee)
         try:
             itip_ics = build_itip_ics(source_ics, planned.method, planned.recipient_email,
-                                      sequence=sequence)
+                                      sequence=sequence, cancel_all=planned.kind != "removed")
         except Exception as e:
             logger.error("Failed to build iTIP message for %r: %s", planned.recipient_email, e)
             return False

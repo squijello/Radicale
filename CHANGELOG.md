@@ -1,6 +1,7 @@
 # Changelog
 
 ## 3.9.3.dev
+* Fix: [hook/email] detect timezone and referenced offset-rule changes even when the first occurrence keeps its offset
 * Fix: [hook/email] normalize mailto identities and validate expanded owner mailboxes consistently across delivery, ownership and Reply-To
 * Docs: [hook/email] clarify supported recurrence values and the scope of MIME serialization tests
 * Fix: [hook/email] bound SMTP socket operations and contain transport failures without masking committed calendar writes

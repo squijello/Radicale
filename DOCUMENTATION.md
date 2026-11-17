@@ -2353,7 +2353,11 @@ finite, already-ended series can still generate a scheduling message. Unchanged
 saves still send nothing. Ordinary past-event and legacy notification guards
 retain their existing behavior.
 
-Update detection compares selected scheduling fields. For recurrence, it
+Update detection compares selected scheduling fields, including start/end
+parameters and the offset rules of referenced VTIMEZONE definitions. A timezone
+change can alter later occurrences even when the first occurrence keeps its
+offset. Unused timezone definitions and descriptive timezone metadata alone do
+not cause updates. For recurrence, it
 compares every `RRULE`, `RDATE` and `EXDATE` value and its parameters, retaining
 timezone and value-type distinctions. Regrouping dates across property lines,
 reordering or repeating the same dates, and reordering rule parts or their

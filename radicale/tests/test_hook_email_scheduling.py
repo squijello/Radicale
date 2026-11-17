@@ -1866,6 +1866,96 @@ class TestRecurrenceFingerprintWiring(BaseTest):
         assert int(vobject.readOne(saved).vevent.sequence.value) == 2
 
 
+def _timezone_event(tzid="Audit/Seasonal", daylight=True):
+    zone = ["BEGIN:VTIMEZONE", "TZID:" + tzid,
+            "BEGIN:STANDARD", "DTSTART:19701101T020000",
+            "RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+            "TZOFFSETFROM:" + ("-0400" if daylight else "-0500"),
+            "TZOFFSETTO:-0500", "END:STANDARD"]
+    if daylight:
+        zone.extend(["BEGIN:DAYLIGHT", "DTSTART:19700308T020000",
+                     "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+                     "TZOFFSETFROM:-0500", "TZOFFSETTO:-0400", "END:DAYLIGHT"])
+    zone.append("END:VTIMEZONE")
+    source = _event([ALICE], dtstart="20270115T100000", dtend="20270115T110000")
+    source = source.replace("BEGIN:VEVENT", "\n".join(zone) + "\nBEGIN:VEVENT")
+    source = source.replace("DTSTART:20270115", "DTSTART;TZID=" + tzid + ":20270115")
+    source = source.replace("DTEND:20270115", "DTEND;TZID=" + tzid + ":20270115")
+    return source.replace("END:VEVENT", "RRULE:FREQ=MONTHLY;BYMONTHDAY=15;COUNT=8\nEND:VEVENT")
+
+
+class TestTimezoneSchedulingWiring(BaseTest):
+    def setup_method(self):
+        TestStoredSchedulingRevision.setup_method(self)
+
+    @pytest.mark.parametrize("rename", [False, True])
+    def test_changed_future_offsets_persist_and_send_new_revision(self, monkeypatch, rename):
+        from datetime import timezone
+        from io import StringIO
+
+        from dateutil.tz import tzical
+
+        sent = TestStoredSchedulingRevision._capture(self, monkeypatch)
+        source = _timezone_event()
+        updated = _timezone_event("Audit/Fixed" if rename else "Audit/Seasonal", False)
+        # vobject caches TZIDs globally. Evaluate the supplied rules with
+        # independent tzical instances, including when the identifier stays.
+        old_zone = tzical(StringIO(source)).get()
+        new_zone = tzical(StringIO(updated)).get()
+        winter, summer = datetime(2027, 1, 15, 10), datetime(2027, 8, 15, 10)
+        assert winter.replace(tzinfo=old_zone) == winter.replace(tzinfo=new_zone)
+        expected = summer.replace(tzinfo=new_zone).astimezone(timezone.utc)
+        assert summer.replace(tzinfo=old_zone).astimezone(timezone.utc) != expected
+        self.put(self.path, source, login="jeff:password")
+        old_etag, _ = TestStoredSchedulingRevision._stored(self)
+        sent.clear()
+        _, headers, _ = self.request("PUT", self.path, updated, check=204,
+                                     login="jeff:password", http_if_match=old_etag)
+        assert "ETag" not in headers
+        _, stored = TestStoredSchedulingRevision._stored(self)
+        assert int(stored.vevent.sequence.value) == 2
+        assert len(sent) == 1
+        assert sent[0].method.value == "REQUEST"
+        assert int(sent[0].vevent.sequence.value) == 2
+        wire_zone = tzical(StringIO(sent[0].serialize())).get()
+        assert summer.replace(tzinfo=wire_zone).astimezone(timezone.utc) == expected
+
+    @pytest.mark.parametrize("name", ["RDATE", "EXDATE"])
+    def test_date_list_referenced_offset_rules_change_revision(self, monkeypatch, name):
+        sent = TestStoredSchedulingRevision._capture(self, monkeypatch)
+        # The event bounds are UTC; only the date list references the zone.
+        source = _timezone_event().replace("DTSTART;TZID=Audit/Seasonal:20270115T100000",
+                                           "DTSTART:20270115T150000Z")
+        source = source.replace("DTEND;TZID=Audit/Seasonal:20270115T110000",
+                                "DTEND:20270115T160000Z")
+        source = source.replace("END:VEVENT", name + ";TZID=Audit/Seasonal:20270815T100000\nEND:VEVENT")
+        updated = source.replace("TZOFFSETTO:-0400", "TZOFFSETTO:-0300")
+        self.put(self.path, source, login="jeff:password")
+        sent.clear()
+        self.put(self.path, updated, check=204, login="jeff:password")
+        _, stored = TestStoredSchedulingRevision._stored(self)
+        assert int(stored.vevent.sequence.value) == 2
+        assert len(sent) == 1 and int(sent[0].vevent.sequence.value) == 2
+        assert sent[0].vtimezone.daylight.tzoffsetto.value == "-0300"
+
+    def test_equivalent_rules_and_unused_timezones_do_not_notify(self, monkeypatch):
+        sent = TestStoredSchedulingRevision._capture(self, monkeypatch)
+        source = _timezone_event()
+        self.put(self.path, source, login="jeff:password")
+        sent.clear()
+        updated = source.replace("FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+                                 "BYDAY=2SU;BYMONTH=3;FREQ=YEARLY")
+        unused = "\n".join(["BEGIN:VTIMEZONE", "TZID:Audit/Unused",
+                            "BEGIN:STANDARD", "DTSTART:19700101T000000",
+                            "TZOFFSETFROM:+0100", "TZOFFSETTO:+0100",
+                            "END:STANDARD", "END:VTIMEZONE"])
+        updated = updated.replace("BEGIN:VEVENT", unused + "\nBEGIN:VEVENT")
+        self.put(self.path, updated, check=204, login="jeff:password")
+        assert sent == []
+        _, stored = TestStoredSchedulingRevision._stored(self)
+        assert int(stored.vevent.sequence.value) == 1
+
+
 def _email_config(**kwargs):
     from radicale.hook.email import EmailConfig, MessageTemplate
     options = dict(host="smtp.example.com", port=587, security="starttls",

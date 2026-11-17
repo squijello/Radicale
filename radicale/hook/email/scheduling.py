@@ -172,8 +172,8 @@ def _recurrence_properties(event, name: str) -> Tuple:
             parameter = parameter.upper()
             normalized = tuple(str(value).upper() if parameter == "VALUE" else str(value)
                                for value in values)
-            # DATE-TIME is the default for both date-list properties.
-            if name in ("rdate", "exdate") and (parameter, normalized) == ("VALUE", ("DATE-TIME",)):
+            # DATE-TIME is the default for temporal and date-list properties.
+            if name in ("dtstart", "dtend", "rdate", "exdate") and (parameter, normalized) == ("VALUE", ("DATE-TIME",)):
                 continue
             parameters.append((parameter, normalized))
         params = tuple(sorted(parameters))
@@ -192,6 +192,33 @@ def _recurrence_properties(event, name: str) -> Tuple:
             # the same recurrence set when their parameters agree.
             entries.add((params, normalized_value))
     return tuple(sorted(entries, key=repr))
+
+
+def _referenced_timezones(calendar, event) -> Tuple:
+    """Compare offset rules used by this event, without expanding recurrence.
+
+    Equal first-occurrence offsets do not imply equal future occurrences.
+    vobject moves native datetime TZID parameters to X-VOBJ-ORIGINAL-TZID.
+    Unused zones and descriptive timezone metadata do not change event times.
+    """
+    referenced = set()
+    for name in ("dtstart", "dtend", "rdate", "exdate"):
+        for line in _content_lines(event, name):
+            for parameter in ("TZID", "X-VOBJ-ORIGINAL-TZID"):
+                referenced.update(line.params.get(parameter, []))
+    definitions = set()
+    for zone in _content_lines(calendar, "vtimezone"):
+        tzid = _first_value(zone, "tzid")
+        if tzid not in referenced:
+            continue
+        observances = set()
+        for name in ("standard", "daylight"):
+            for observance in _content_lines(zone, name):
+                observances.add((name, tuple(
+                    _recurrence_properties(observance, field)
+                    for field in ("dtstart", "rrule", "rdate", "tzoffsetfrom", "tzoffsetto"))))
+        definitions.add((tzid, tuple(sorted(observances, key=repr))))
+    return tuple(sorted(definitions, key=repr))
 
 
 @dataclass(frozen=True)
@@ -278,13 +305,14 @@ def parse_event(ics: Optional[str]) -> Optional[EventInfo]:
         raw("summary"),
         raw("description"),
         raw("location"),
-        raw("dtstart"),
-        raw("dtend"),
+        _recurrence_properties(event, "dtstart"),
+        _recurrence_properties(event, "dtend"),
         raw("duration"),
         raw("status"),
         _recurrence_properties(event, "rrule"),
         _recurrence_properties(event, "rdate"),
         _recurrence_properties(event, "exdate"),
+        _referenced_timezones(calendar, event),
         raw("recurrence-id"),
         extract_email(organizer_value),
     )

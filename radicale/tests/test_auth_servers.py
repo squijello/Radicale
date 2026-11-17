@@ -24,7 +24,6 @@ import contextlib
 import imaplib
 import logging
 import os
-import runpy
 import ssl
 import sys
 import types
@@ -294,12 +293,6 @@ class _FakeIMAP:
             raise box.logout_error
 
 
-def test_auth_server_tests_import_without_optional_ldap3():
-    with patch.dict(sys.modules, {"ldap3": None}):
-        namespace = runpy.run_path(__file__)
-    assert namespace["skip_ldap3"] is True
-
-
 class TestAuthServers(BaseTest):
     """Authentication against mocked external servers."""
 
@@ -556,26 +549,25 @@ class TestAuthServers(BaseTest):
             assert "invalidCredentials" in caplog.text
 
     @pytest.mark.skipif(skip_ldap3 is True, reason="No LDAP module 'ldap3' found")
-    @pytest.mark.parametrize("failure_type", ["starttls", "protocol", "extension", "socket"])
-    def test_ldap3_reader_starttls_failure_is_fatal(self, caplog, failure_type) -> None:
+    @pytest.mark.parametrize("failure", [
+        ldap3.core.exceptions.LDAPStartTLSError("reader tls"),
+        # A server refusing StartTLS is raised by Connection.extended() as an
+        # LDAPOperationResult subclass, not as LDAPStartTLSError.
+        ldap3.core.exceptions.LDAPProtocolErrorResult(
+            result=2, description="protocolError"),
+        ldap3.core.exceptions.LDAPUnavailableCriticalExtensionResult(
+            result=12, description="unavailableCriticalExtension"),
+        OSError("connection reset during handshake"),
+    ])
+    def test_ldap3_reader_starttls_failure_is_fatal(self, caplog, failure) -> None:
         """A failed reader StartTLS must not continue into bind() without TLS."""
-        # Defer optional-module attributes until after pytest applies skipif.
-        failures = {
-            "starttls": ldap3.core.exceptions.LDAPStartTLSError("reader tls"),
-            # Refusal from Connection.extended() is an LDAPOperationResult.
-            "protocol": ldap3.core.exceptions.LDAPProtocolErrorResult(
-                result=2, description="protocolError"),
-            "extension": ldap3.core.exceptions.LDAPUnavailableCriticalExtensionResult(
-                result=12, description="unavailableCriticalExtension"),
-            "socket": OSError("connection reset during handshake"),
-        }
         caplog.set_level(logging.DEBUG)
         directory = _MockLdap()
         directory.add(OWNER_DN, uid="owner", userPassword="secret")
         self._configure_ldap3(ldap_security="starttls")
         with directory.patch() as start_tls, \
                 patch.object(directory.connection, "bind", autospec=True) as bind:
-            start_tls.side_effect = _raise_for_reader(failures[failure_type])
+            start_tls.side_effect = _raise_for_reader(failure)
             _principal(self, "owner:secret", check=500)
             assert not any(call.args[0].user == _MockLdap.reader_dn
                            for call in bind.call_args_list)

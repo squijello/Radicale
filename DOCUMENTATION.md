@@ -1769,6 +1769,12 @@ the parser's timezone fallback behavior. The timezone interpretation correction
 invalidates older derived item-cache ranges in both cache modes; they rebuild on
 access without deleting calendar files or history/sync-token caches.
 
+##### filesystem_fsync
+
+Sync file system after each write
+
+Default: `True`
+
 ##### folder_umask
 
 _(>= 3.3.2)_

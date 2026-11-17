@@ -45,6 +45,8 @@ from urllib.parse import unquote_to_bytes, urlsplit
 import vobject
 from dateutil.tz import tzutc
 
+from radicale import item as radicale_item
+
 __all__ = [
     "AttendeeInfo",
     "EventInfo",
@@ -260,7 +262,7 @@ def parse_event(ics: Optional[str]) -> Optional[EventInfo]:
     if not ics:
         return None
     try:
-        calendar = vobject.readOne(ics)
+        calendar = radicale_item.read_one(ics)
     except Exception:
         return None
     vevents = getattr(calendar, "vevent_list", None)
@@ -503,7 +505,7 @@ def _vevent_count(ics: Optional[str]) -> int:
     if not ics:
         return 0
     try:
-        calendar = vobject.readOne(ics)
+        calendar = radicale_item.read_one(ics)
     except Exception:
         return 0
     vevents = getattr(calendar, "vevent_list", None)
@@ -641,7 +643,7 @@ def prepare_itip_upload(old_ics: Optional[str], new_ics: str,
             _vevent_count(new_ics) != 1 or
             not check_ownership(new_event.organizer_email, owner_identities)):
         return None
-    calendar = vobject.readOne(new_ics)
+    calendar = radicale_item.read_one(new_ics)
     new_sequence = _event_sequence(calendar.vevent)
     if old_ics is None:
         return None
@@ -651,7 +653,7 @@ def prepare_itip_upload(old_ics: Optional[str], new_ics: str,
             old_event.uid != new_event.uid or
             old_event.organizer_email != new_event.organizer_email):
         return None
-    old_sequence = _event_sequence(vobject.readOne(old_ics).vevent)
+    old_sequence = _event_sequence(radicale_item.read_one(old_ics).vevent)
     target = max(old_sequence, new_sequence)
     planned = plan_messages(old_ics, new_ics, owner_identities=owner_identities)
     # RFC 5546 section 3.2.2.7 keeps SEQUENCE for a pure RSVP re-request.
@@ -702,7 +704,7 @@ def build_itip_ics(source_ics: str, method: str, recipient_email: str,
         raise ValueError("unsupported iTIP method: %r" % method)
     if _vevent_count(source_ics) > 1:
         raise ValueError("multi-VEVENT calendar objects are rejected")
-    calendar = vobject.readOne(source_ics)
+    calendar = radicale_item.read_one(source_ics)
     # vobject stores METHOD as a top-level property of VCALENDAR.
     if "method" in calendar.contents:
         calendar.contents["method"][0].value = method

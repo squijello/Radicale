@@ -42,8 +42,9 @@ from radicale.utils import format_ut
 
 INTERNAL_TYPES: Sequence[str] = ("multifilesystem", "multifilesystem_nolock",)
 
-# NOTE: change only if cache structure is modified to avoid cache invalidation on update
-CACHE_VERSION_RADICALE = "3.3.1"
+# Change when the cache layout or parsing semantics of derived values change.
+# Calendar-local timezone rules affect the cached start/end time range.
+CACHE_VERSION_RADICALE = "3.9.3"
 
 CACHE_VERSION: bytes = (
             "%s=%s;%s=%s;" % ("radicale", CACHE_VERSION_RADICALE, "vobject", utils.package_version("vobject"))).encode()

@@ -342,6 +342,536 @@ permissions: RrWw""")
             2
         )
 
+    @staticmethod
+    def _local_timezone_source(tzid, daylight, uid="local-zone"):
+        zone = ["BEGIN:VTIMEZONE", "TZID:" + tzid,
+                "BEGIN:STANDARD", "DTSTART:19701101T020000",
+                "RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+                "TZOFFSETFROM:" + ("-0400" if daylight else "-0500"),
+                "TZOFFSETTO:-0500", "END:STANDARD"]
+        if daylight:
+            zone += ["BEGIN:DAYLIGHT", "DTSTART:19700308T020000",
+                     "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+                     "TZOFFSETFROM:-0500", "TZOFFSETTO:-0400", "END:DAYLIGHT"]
+        return "\r\n".join([
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Test//EN", *zone,
+            "END:VTIMEZONE", "BEGIN:VEVENT", "UID:" + uid,
+            "DTSTAMP:20261117T120000Z", "DTSTART;TZID=" + tzid + ":20270115T100000",
+            "DTEND;TZID=" + tzid + ":20270115T110000",
+            "RRULE:FREQ=MONTHLY;BYMONTHDAY=15;COUNT=8", "END:VEVENT", "END:VCALENDAR", ""])
+
+    @staticmethod
+    def _local_timezone_query(uid=None, start="20270815T000000Z", end="20270816T000000Z", expand=True):
+        data = '<C:calendar-data><C:expand start="%s" end="%s"/></C:calendar-data>' % (start, end)
+        if not expand:
+            data = "<C:calendar-data/>"
+        uid_filter = ('<C:prop-filter name="UID"><C:text-match>%s</C:text-match></C:prop-filter>' % uid
+                      if uid else "")
+        return '''<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+          <D:prop><D:getetag/>%s</D:prop><C:filter><C:comp-filter name="VCALENDAR">
+            <C:comp-filter name="VEVENT"><C:time-range start="%s" end="%s"/>%s</C:comp-filter>
+          </C:comp-filter></C:filter></C:calendar-query>''' % (data, start, end, uid_filter)
+
+    @staticmethod
+    def _local_timezone_starts(responses):
+        starts = []
+        for response in responses.values():
+            assert isinstance(response, dict)
+            status, data = response["C:calendar-data"]
+            assert status == 200 and data.text
+            starts.extend(event.dtstart.value.strftime("%Y%m%dT%H%M%SZ")
+                          for event in vobject.readOne(data.text).vevent_list)
+        return starts
+
+    @pytest.mark.parametrize("mtime_cache", [False, True])
+    def test_timezone_rule_edit_updates_live_expansion_and_plain_queries(self, mtime_cache):
+        from datetime import datetime, timezone
+        from io import StringIO
+        from uuid import uuid4
+
+        from dateutil.tz import tzical
+
+        self.configure({"storage": {"use_mtime_and_size_for_item_cache": str(mtime_cache)}})
+        self.mkcalendar("/test/")
+        path = "/test/zone.ics"
+        tzid = "Test/Local-" + uuid4().hex
+        source = self._local_timezone_source(tzid, True)
+        self.put(path, source)
+        _, headers, _ = self.request("GET", path, check=200)
+        _, responses = self.report("/test/", self._local_timezone_query("local-zone"))
+        assert self._local_timezone_starts(responses) == ["20270815T140000Z"]
+        updated = self._local_timezone_source(tzid, False)
+        self.request("PUT", path, updated, check=204, http_if_match=headers["ETag"])
+        _, headers_after, stored = self.request("GET", path, check=200)
+        declared = tzical(StringIO(stored)).get(tzid)
+        expected = datetime(2027, 8, 15, 10, tzinfo=declared).astimezone(timezone.utc)
+        assert expected.strftime("%Y%m%dT%H%M%SZ") == "20270815T150000Z"
+        assert headers_after["ETag"] != headers["ETag"]
+        for _ in range(2):
+            _, responses = self.report("/test/", self._local_timezone_query("local-zone"))
+            assert self._local_timezone_starts(responses) == [expected.strftime("%Y%m%dT%H%M%SZ")]
+            _, plain = self.report("/test/", self._local_timezone_query(
+                start="20270815T153000Z", end="20270815T154500Z", expand=False))
+            assert list(plain) == [path]
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_timezone_definitions_are_independent_per_resource(self, reverse):
+        from uuid import uuid4
+
+        self.mkcalendar("/test/")
+        tzid = "Test/Resources-" + uuid4().hex
+        definitions = [("seasonal", True, "20270815T140000Z"), ("fixed", False, "20270815T150000Z")]
+        if reverse:
+            definitions.reverse()
+        for uid, daylight, _ in definitions:
+            self.put("/test/%s.ics" % uid, self._local_timezone_source(tzid, daylight, uid))
+        for uid, _, expected in definitions + definitions[::-1]:
+            _, responses = self.report("/test/", self._local_timezone_query(uid))
+            assert self._local_timezone_starts(responses) == [expected]
+
+    @pytest.mark.parametrize("entrypoint", ["stream", "lazy", "native"])
+    def test_timezone_scope_survives_serialization_and_concurrent_parsing(self, entrypoint):
+        from concurrent.futures import ThreadPoolExecutor
+        from datetime import datetime, timezone
+        from uuid import uuid4
+
+        from radicale import item as radicale_item
+
+        tzid = "Test/Concurrent-" + uuid4().hex
+        sources = [self._local_timezone_source(tzid, daylight) for daylight in (True, False)]
+        vobject.readOne(sources[0])  # Warm the dependency's first-seen registry.
+
+        def check(index):
+            source = sources[index % 2]
+            if entrypoint == "stream":
+                calendar, = radicale_item.read_components(source)
+            elif entrypoint == "lazy":
+                calendar = radicale_item.Item(collection_path="test", text=source).vobject_item
+            else:
+                calendar = radicale_item.Item(collection_path="test", vobject_item=vobject.readOne(source)).vobject_item
+            calendar.serialize()
+            zone = calendar.vevent.dtstart.value.tzinfo
+            return datetime(2027, 8, 15, 10, tzinfo=zone).astimezone(timezone.utc).hour
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            actual = list(pool.map(check, range(32)))
+        assert actual == [14, 15] * 16
+        first, second = radicale_item.read_components("".join(sources))
+        assert first.vevent.dtstart.value.tzinfo is not second.vevent.dtstart.value.tzinfo
+
+    @pytest.mark.parametrize("kind", ["rdate", "exdate", "override"])
+    def test_timezone_scope_includes_date_lists_and_overrides(self, kind):
+        from uuid import uuid4
+
+        from radicale import item as radicale_item
+
+        self.mkcalendar("/test/")
+        tzid = "Test/DateLists-" + uuid4().hex
+        radicale_item.read_components(self._local_timezone_source(tzid, True))
+        source = self._local_timezone_source(tzid, False)
+        if kind in ("rdate", "exdate"):
+            source = source.replace("DTSTART;TZID=" + tzid + ":20270115T100000", "DTSTART:20270115T150000Z")
+            source = source.replace("DTEND;TZID=" + tzid + ":20270115T110000", "DTEND:20270115T160000Z")
+            day = "22" if kind == "rdate" else "15"
+            source = source.replace("END:VEVENT", kind.upper() + ";TZID=" + tzid + ":202708" + day + "T100000\r\nEND:VEVENT")
+        else:
+            override = "\r\n".join([
+                "BEGIN:VEVENT", "UID:local-zone", "DTSTAMP:20261117T120000Z",
+                "RECURRENCE-ID;TZID=" + tzid + ":20270815T100000",
+                "DTSTART;TZID=" + tzid + ":20270815T120000",
+                "DTEND;TZID=" + tzid + ":20270815T130000", "END:VEVENT"])
+            source = source.replace("END:VCALENDAR", override + "\r\nEND:VCALENDAR")
+        self.put("/test/zone.ics", source)
+        start, end = ("20270822T000000Z", "20270823T000000Z") if kind == "rdate" else ("20270815T000000Z", "20270816T000000Z")
+        _, responses = self.report("/test/", self._local_timezone_query("local-zone", start, end))
+        assert self._local_timezone_starts(responses) == {
+            "rdate": ["20270822T150000Z"], "exdate": [], "override": ["20270815T170000Z"]}[kind]
+
+    @pytest.mark.parametrize("kind", ["utc", "utc-with-tzid", "internal-param", "floating", "date"])
+    def test_timezone_scope_preserves_utc_floating_and_date_values(self, kind):
+        from datetime import date, datetime, timezone
+        from io import StringIO
+        from uuid import uuid4
+
+        from radicale import item as radicale_item
+
+        tzid = "Test/Unzoned-" + uuid4().hex
+        source = self._local_timezone_source(tzid, False)
+        if kind in ("utc", "utc-with-tzid", "internal-param"):
+            prefix = {"utc": "", "utc-with-tzid": ";TZID=" + tzid,
+                      "internal-param": ";X-VOBJ-ORIGINAL-TZID=" + tzid}[kind]
+            start = "DTSTART" + prefix + ":20270115T100000Z"
+        elif kind == "date":
+            start = "DTSTART;VALUE=DATE:20270115"
+        else:
+            start = "DTSTART:20270115T100000"
+        source = source.replace("DTSTART;TZID=" + tzid + ":20270115T100000", start)
+        calendar, = radicale_item.read_components(source)
+        before = calendar.vevent.dtstart.value
+        buffer = StringIO()
+        calendar.serialize(buf=buffer, lineLength=40, validate=False)
+        assert "BEGIN:VCALENDAR" in buffer.getvalue()
+        assert calendar.vevent.dtstart.value == before
+        if kind == "date":
+            assert type(before) is date
+        elif kind == "floating":
+            assert before.tzinfo is None
+        else:
+            assert before == datetime(2027, 1, 15, 10, tzinfo=timezone.utc)
+
+    @pytest.mark.parametrize("name", ["DTSTAMP", "CREATED", "LAST-MODIFIED"])
+    def test_timezone_scope_keeps_force_utc_properties_in_utc(self, name):
+        from datetime import datetime, timezone
+        from uuid import uuid4
+
+        from radicale import item as radicale_item
+
+        tzid = "Test/Stamp-" + uuid4().hex
+        source = self._local_timezone_source(tzid, False)
+        line = name + ";TZID=" + tzid + ":20261117T120000Z"
+        if name == "DTSTAMP":
+            source = source.replace("DTSTAMP:20261117T120000Z", line)
+        else:
+            source = source.replace("END:VEVENT", line + "\r\nEND:VEVENT")
+        parsed = radicale_item.read_one(source)
+        item = radicale_item.Item(collection_path="test", vobject_item=parsed)
+        serialized = item.serialize()
+        wire = vobject.readOne(serialized)
+        stamp = getattr(wire.vevent, name.lower().replace("-", "_")).value
+        assert stamp == datetime(2026, 11, 17, 12, tzinfo=timezone.utc)
+
+    def test_timezone_scope_preserves_the_supplied_native_tree(self):
+        from datetime import datetime
+        from uuid import uuid4
+
+        from radicale import item as radicale_item
+
+        tzid = "Test/Native-" + uuid4().hex
+        vobject.readOne(self._local_timezone_source(tzid, True))
+        supplied = vobject.readOne(self._local_timezone_source(tzid, False))
+        zone = supplied.vtimezone.gettzinfo()
+        supplied.vevent.dtstart.value = supplied.vevent.dtstart.value.replace(tzinfo=zone)
+        supplied.vevent.dtend.value = supplied.vevent.dtend.value.replace(tzinfo=zone)
+        item = radicale_item.Item(collection_path="test", vobject_item=supplied)
+        item.serialize()
+        assert supplied.vevent.dtstart.value.tzinfo is zone
+        assert datetime(2027, 8, 15, tzinfo=zone).utcoffset().total_seconds() == -18000
+
+    @pytest.mark.parametrize("reserved_id", [False, True])
+    def test_timezone_rules_outside_library_utc_equivalence_window(self, reserved_id):
+        from datetime import datetime, timezone
+        from io import StringIO
+        from uuid import uuid4
+
+        from dateutil.tz import tzical
+
+        from radicale import item as radicale_item
+
+        tzid = "UTC" if reserved_id else "Test/Future-" + uuid4().hex
+        source = self._local_timezone_source(tzid, False)
+        source = source.replace("TZOFFSETFROM:-0500", "TZOFFSETFROM:+0000")
+        source = source.replace("TZOFFSETTO:-0500", "TZOFFSETTO:+0000")
+        source = source.replace("RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU\r\n", "")
+        transition = "\r\n".join(["BEGIN:STANDARD", "DTSTART:20250101T000000",
+                                  "TZOFFSETFROM:+0000", "TZOFFSETTO:+0100", "END:STANDARD"])
+        source = source.replace("END:VTIMEZONE", transition + "\r\nEND:VTIMEZONE")
+        expected = datetime(2027, 8, 15, 10, tzinfo=tzical(StringIO(source)).get(tzid))
+        assert expected.utcoffset().total_seconds() == 3600
+        for parsed in (radicale_item.read_one(source), vobject.readOne(source)):
+            item = radicale_item.Item(collection_path="test", vobject_item=parsed)
+            text = item.serialize()
+            assert "DTSTART;TZID=" + tzid + ":20270115T100000\r\n" in text
+            assert item.vobject_item.vevent.dtstart.value.utcoffset().total_seconds() == 3600
+        self.mkcalendar("/test/")
+        self.put("/test/zone.ics", source)
+        _, responses = self.report("/test/", self._local_timezone_query(
+            start="20270815T093000Z", end="20270815T094500Z", expand=False))
+        assert list(responses) == ["/test/zone.ics"]
+        _, responses = self.report("/test/", self._local_timezone_query("local-zone"))
+        assert self._local_timezone_starts(responses) == [expected.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")]
+
+    @pytest.mark.parametrize("date_list", [False, True])
+    def test_timezone_scope_handles_partially_native_components(self, date_list):
+        from datetime import datetime
+        from uuid import uuid4
+
+        from radicale import item as radicale_item
+
+        tzid = "Test/Partial-" + uuid4().hex
+        vobject.readOne(self._local_timezone_source(tzid, True))
+        source = self._local_timezone_source(tzid, False)
+        if date_list:
+            source = source.replace("END:VEVENT", "RDATE;TZID=" + tzid + ":20270822T100000\r\nEND:VEVENT")
+        partial = vobject.readOne(source, transform=False)
+        partial.vevent.transformChildrenToNative()
+        item = radicale_item.Item(collection_path="test", vobject_item=partial)
+        calendar = item.vobject_item
+        zone = calendar.vevent.dtstart.value.tzinfo
+        assert datetime(2027, 8, 15, tzinfo=zone).utcoffset().total_seconds() == -18000
+        if date_list:
+            assert calendar.vevent.rdate.value[0].utcoffset().total_seconds() == -18000
+
+    @pytest.mark.parametrize("scoped", [False, True])
+    @pytest.mark.parametrize("other_offset", [None, 0, 2, "declared", "floating"])
+    def test_timezone_scope_preserves_native_values_without_tzid_parameters(self, scoped, other_offset):
+        from datetime import datetime, timedelta
+        from uuid import uuid4
+
+        from dateutil.tz import tzoffset, tzutc
+
+        from radicale import item as radicale_item
+
+        tzid = "Test/Implicit-" + uuid4().hex
+        source = self._local_timezone_source(tzid, False)
+        source = source.replace("TZOFFSETFROM:-0500", "TZOFFSETFROM:+0000")
+        source = source.replace("TZOFFSETTO:-0500", "TZOFFSETTO:+0000")
+        source = source.replace("RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU\r\n", "")
+        transition = "\r\n".join(["BEGIN:STANDARD", "DTSTART:20250101T000000",
+                                  "TZOFFSETFROM:+0000", "TZOFFSETTO:+0100", "END:STANDARD"])
+        source = source.replace("END:VTIMEZONE", transition + "\r\nEND:VTIMEZONE")
+        calendar = radicale_item.read_one(source) if scoped else vobject.readOne(source, transform=False)
+        zone = vobject.icalendar.TimezoneComponent.gettzinfo(calendar.vtimezone)
+        if other_offset == "declared":
+            other = vobject.readOne(self._local_timezone_source("Test/Other-" + uuid4().hex, False), transform=False)
+            other.vtimezone.standard.tzoffsetfrom.value = "+0200"
+            other.vtimezone.standard.tzoffsetto.value = "+0200"
+            other_zone = vobject.icalendar.TimezoneComponent.gettzinfo(other.vtimezone)
+            calendar.add(other.vtimezone)
+        calendar.contents.pop("vevent")
+        event = vobject.newFromBehavior("vevent")
+        event.add("uid").value = "implicit-zone"
+        event.add("dtstamp").value = datetime(2026, 11, 17, 12, tzinfo=tzutc())
+        start = datetime(2027, 1, 15, 10, tzinfo=zone)
+        event.add("dtstart").value = start
+        event.add("dtend").value = start + timedelta(hours=1)
+        if other_offset is not None:
+            if other_offset == "floating":
+                other_zone = None
+            elif other_offset != "declared":
+                other_zone = tzoffset(None, other_offset * 3600) if other_offset else tzutc()
+            event.add("rdate").value = [start + timedelta(days=1), datetime(2027, 1, 17, 10, tzinfo=other_zone)]
+        calendar.add(event)
+        assert event.dtstart.params == {}
+        item = radicale_item.Item(collection_path="test", vobject_item=calendar)
+        assert item.vobject_item.vevent.dtstart.value == start
+        assert item.vobject_item.vevent.dtstart.value.utcoffset() == timedelta(hours=1)
+        text = item.serialize()
+        assert "DTSTART;TZID=" + tzid + ":20270115T100000\r\n" in text
+        if other_offset is not None:
+            assert item.vobject_item.vevent.rdate.value == event.rdate.value
+            expected_hour = 10 if other_offset == "floating" else (8 if other_offset == "declared" else 10 - other_offset)
+            expected = "RDATE:20270116T090000Z,20270117T%02d0000%s\r\n" % (
+                expected_hour, "" if other_offset == "floating" else "Z")
+            assert expected in text.replace("\r\n ", "")
+            assert radicale_item.read_one(text).vevent.rdate.value == event.rdate.value
+        assert event.dtstart.value is start and event.dtstart.params == {}
+
+    def test_timezone_scope_native_edits_override_stale_generated_metadata(self):
+        from datetime import datetime, timedelta
+        from uuid import uuid4
+
+        from radicale import item as radicale_item
+
+        first = "Test/Before-" + uuid4().hex
+        second = "Test/After-" + uuid4().hex
+        source = self._local_timezone_source(first, False)
+        other = self._local_timezone_source(second, False)
+        other = other.replace("TZOFFSETFROM:-0500", "TZOFFSETFROM:+0000")
+        other = other.replace("TZOFFSETTO:-0500", "TZOFFSETTO:+0000")
+        other = other.replace("RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU\r\n", "")
+        transition = "\r\n".join(["BEGIN:STANDARD", "DTSTART:20250101T000000",
+                                  "TZOFFSETFROM:+0000", "TZOFFSETTO:+0200", "END:STANDARD"])
+        zone_text = other[other.index("BEGIN:VTIMEZONE"):other.index("END:VTIMEZONE")]
+        source = source.replace("BEGIN:VEVENT", zone_text + transition + "\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT")
+        calendar = radicale_item.read_one(source)
+        zone = vobject.icalendar.TimezoneComponent.gettzinfo(calendar.vtimezone_list[1])
+        start = datetime(2027, 1, 15, 10, tzinfo=zone)
+        calendar.vevent.dtstart.value = start
+        calendar.vevent.dtend.value = start + timedelta(hours=1)
+        assert calendar.vevent.dtstart.params["X-VOBJ-ORIGINAL-TZID"] == [first]
+        text = calendar.serialize()
+        assert "DTSTART;TZID=" + second + ":20270115T100000\r\n" in text
+        assert radicale_item.read_one(text).vevent.dtstart.value == start
+        assert calendar.vevent.dtstart.value is start
+
+    @pytest.mark.parametrize("scoped", [False, True])
+    def test_timezone_scope_native_edits_can_introduce_a_new_dst_zone(self, scoped):
+        from datetime import datetime, timedelta
+        from uuid import uuid4
+
+        from radicale import item as radicale_item
+
+        first = "Test/Old-" + uuid4().hex
+        second = "Test/New-" + uuid4().hex
+        source = self._local_timezone_source(first, False)
+        calendar = radicale_item.read_one(source) if scoped else vobject.readOne(source)
+        other = vobject.readOne(self._local_timezone_source(second, True), transform=False)
+        zone = vobject.icalendar.TimezoneComponent.gettzinfo(other.vtimezone)
+        start = datetime(2027, 1, 15, 10, tzinfo=zone)
+        calendar.vevent.dtstart.value = start
+        calendar.vevent.dtend.value = start + timedelta(hours=1)
+        assert calendar.vevent.dtstart.params["X-VOBJ-ORIGINAL-TZID"] == [first]
+        item = radicale_item.Item(collection_path="test", vobject_item=calendar)
+        text = item.serialize()
+        assert "DTSTART;TZID=" + second + ":20270115T100000\r\n" in text
+        saved = radicale_item.read_one(text)
+        assert saved.vevent.dtstart.value == start
+        assert datetime(2027, 8, 15, tzinfo=saved.vevent.dtstart.value.tzinfo).utcoffset() == timedelta(hours=-4)
+        assert calendar.vevent.dtstart.value is start
+
+    @pytest.mark.parametrize("scoped", [False, True])
+    @pytest.mark.parametrize("other_kind", ["named", "utc", "floating"])
+    def test_timezone_scope_preserves_mixed_undeclared_native_date_lists(self, scoped, other_kind):
+        from datetime import datetime
+        from uuid import uuid4
+
+        from dateutil.tz import tzutc
+
+        from radicale import item as radicale_item
+
+        first = "Test/Old-" + uuid4().hex
+        source = self._local_timezone_source(first, False).replace(
+            "END:VEVENT", "RDATE;TZID=" + first + ":20270822T100000\r\nEND:VEVENT")
+        calendar = radicale_item.read_one(source) if scoped else vobject.readOne(source)
+        sources = [self._local_timezone_source("Test/New-" + uuid4().hex, True),
+                   self._local_timezone_source("Test/Other-" + uuid4().hex, False).replace("-0500", "-0600")]
+        zones = [vobject.icalendar.TimezoneComponent.gettzinfo(vobject.readOne(source, transform=False).vtimezone)
+                 for source in sources]
+        if other_kind != "named":
+            zones[1] = tzutc() if other_kind == "utc" else None
+        values = [datetime(2027, 8, 22, 10, tzinfo=zones[0]), datetime(2027, 8, 23, 10, tzinfo=zones[1])]
+        calendar.vevent.rdate.value = values
+        assert (calendar.vevent.rdate.params.get("TZID") or
+                calendar.vevent.rdate.params.get("X-VOBJ-ORIGINAL-TZID")) == [first]
+        item = radicale_item.Item(collection_path="test", vobject_item=calendar)
+        assert item.vobject_item.vevent.rdate.value == values
+        text = item.serialize()
+        expected = {"named": "160000Z", "utc": "100000Z", "floating": "100000"}[other_kind]
+        assert "RDATE:20270822T140000Z,20270823T" + expected + "\r\n" in text
+        assert radicale_item.read_one(text).vevent.rdate.value == values
+
+    def test_timezone_scope_preserves_definitions_in_collection_imports(self):
+        from uuid import uuid4
+
+        from radicale import item as radicale_item
+
+        tzid = "Test/Bulk-" + uuid4().hex
+        other_tzid = "Test/Other-" + uuid4().hex
+        radicale_item.read_one(self._local_timezone_source(tzid, True))
+        source = self._local_timezone_source(tzid, False, "first-zone")
+        other = self._local_timezone_source(other_tzid, True, "second-zone")
+        other_contents = other[other.index("BEGIN:VTIMEZONE"):other.index("END:VCALENDAR")]
+        source = source.replace("END:VCALENDAR", other_contents + "END:VCALENDAR")
+        self.put("/bulk/", source)
+        _, responses = self.report("/bulk/", self._local_timezone_query("first-zone"))
+        assert self._local_timezone_starts(responses) == ["20270815T150000Z"]
+        _, responses = self.report("/bulk/", self._local_timezone_query("second-zone"))
+        assert self._local_timezone_starts(responses) == ["20270815T140000Z"]
+        for uid, expected_zone in [("first-zone", tzid), ("second-zone", other_tzid)]:
+            _, _, stored = self.request("GET", "/bulk/" + uid + ".ics", check=200)
+            calendar = vobject.readOne(stored)
+            assert [zone.tzid.value for zone in calendar.vtimezone_list] == [expected_zone]
+
+    @pytest.mark.parametrize("year", [1, 999])
+    def test_timezone_serialization_pads_years_on_older_strftime_platforms(self, year):
+        from datetime import datetime
+        from uuid import uuid4
+
+        from radicale import item as radicale_item
+
+        class LegacyDatetime(datetime):
+            def strftime(self, fmt):
+                # Older supported Python/Linux delegates %Y to libc, which
+                # may return an unpadded year. Reproduce that behavior here.
+                return super().strftime(fmt.replace("%Y", str(self.year)))
+
+        tzid = "Test/Early-" + uuid4().hex
+        source = self._local_timezone_source(tzid, False).replace("20270115", "%04d0115" % year)
+        calendar, = radicale_item.read_components(source)
+        value = calendar.vevent.dtstart.value
+        calendar.vevent.dtstart.value = LegacyDatetime(
+            year, value.month, value.day, value.hour, value.minute, value.second, tzinfo=value.tzinfo)
+        serialized = calendar.serialize()
+        assert "DTSTART;TZID=" + tzid + ":%04d0115T100000\r\n" % year in serialized
+
+    def test_timezone_scope_binds_native_period_values(self):
+        from uuid import uuid4
+
+        from radicale import item as radicale_item
+
+        tzid = "Test/Periods-" + uuid4().hex
+        vobject.readOne(self._local_timezone_source(tzid, True))
+        source = self._local_timezone_source(tzid, False).replace(
+            "END:VEVENT", "RDATE;VALUE=PERIOD;TZID=" + tzid +
+            ":20270815T100000/20270815T110000,20270822T100000/PT1H\r\nEND:VEVENT")
+        calendar, = radicale_item.read_components(source)
+        # This checks native binding only; it does not extend vobject's
+        # documented limits on PERIOD serialization and server operations.
+        values = calendar.vevent.rdate.value
+        assert values[0][0].utcoffset().total_seconds() == -18000
+        assert values[0][1].utcoffset().total_seconds() == -18000
+        assert values[1][0].utcoffset().total_seconds() == -18000
+        assert values[1][1].total_seconds() == 3600
+
+    def test_timezone_scope_rejects_duplicate_definitions_before_storage(self):
+        from uuid import uuid4
+
+        self.mkcalendar("/test/")
+        tzid = "Test/Ambiguous-" + uuid4().hex
+        source = self._local_timezone_source(tzid, True)
+        fixed = self._local_timezone_source(tzid, False)
+        zone = fixed[fixed.index("BEGIN:VTIMEZONE"):fixed.index("END:VTIMEZONE") + len("END:VTIMEZONE")]
+        source = source.replace("BEGIN:VEVENT", zone + "\r\nBEGIN:VEVENT")
+        self.put("/test/ambiguous.ics", source, check=400)
+        self.get("/test/ambiguous.ics", check=404)
+
+    @pytest.mark.parametrize("mtime_cache", [False, True])
+    @pytest.mark.parametrize("folded", [None, "before-colon", "after-space"])
+    def test_timezone_upgrade_rebuilds_legacy_ranges_without_changing_calendar(self, mtime_cache, folded):
+        import pickle
+        from hashlib import sha256
+        from pathlib import Path
+        from uuid import uuid4
+
+        from radicale import item as radicale_item
+        from radicale import utils
+
+        self.configure({"storage": {"use_mtime_and_size_for_item_cache": str(mtime_cache)}})
+        self.mkcalendar("/test/")
+        if folded == "before-colon":
+            tzid = "Test/" + "A" * 25 + uuid4().hex
+        elif folded == "after-space":
+            tzid = "Test/" + "A" * 64 + " " + uuid4().hex[:10]
+        else:
+            tzid = "Test/Upgrade-" + uuid4().hex
+        radicale_item.read_one(self._local_timezone_source(tzid, True))
+        self.put("/test/zone.ics", self._local_timezone_source(tzid, False))
+        _, headers, body = self.request("GET", "/test/zone.ics", check=200)
+        data = Path(self.colpath) / "collection-root" / "test" / "zone.ics"
+        cache = data.parent / ".Radicale.cache" / "item" / data.name
+        raw, info = data.read_bytes(), data.stat()
+        if folded == "before-colon":
+            # The normal 75-column serializer folds this valid parameter just
+            # before the colon. The Outlook same-line workaround must not eat
+            # the continuation space when an old cache forces reparsing.
+            assert ("DTSTART;TZID=" + tzid + "\r\n :").encode() in raw
+        elif folded == "after-space":
+            assert ("TZID:" + tzid[:70] + "\r\n " + tzid[70:]).encode() in raw
+        legacy = ("radicale=3.3.1;vobject=%s;" % utils.package_version("vobject")).encode()
+        legacy_hash = (legacy.decode() + "size=%s;mtime=%s" % (info.st_size, info.st_mtime_ns)
+                       if mtime_cache else sha256(legacy + raw).hexdigest())
+        content = list(pickle.loads(cache.read_bytes()))
+        content[0], content[-2], content[-1] = legacy_hash, 0, 1
+        cache.write_bytes(pickle.dumps(tuple(content)))
+        self.configure({})  # New application, same storage and old cache files.
+        _, after_headers, after = self.request("GET", "/test/zone.ics", check=200)
+        _, responses = self.report("/test/", self._local_timezone_query(
+            start="20270815T153000Z", end="20270815T154500Z", expand=False))
+        assert list(responses) == ["/test/zone.ics"]
+        assert after == body and after_headers["ETag"] == headers["ETag"]
+        assert data.read_bytes() == raw and data.stat().st_mtime_ns == info.st_mtime_ns
+        assert pickle.loads(cache.read_bytes())[0] != legacy_hash
+
     def test_report_with_expand_property_timezone(self):
         self._test_expand(
             "event_weekly_rrule",

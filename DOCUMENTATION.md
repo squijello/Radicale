@@ -1762,6 +1762,13 @@ Notes:
 * conversion is done on access
 * bulk conversion can be done offline using the storage verification option `radicale --verify-storage`
 
+Calendar resources use their own declared VTIMEZONE definitions, including when
+another resource uses the same TZID with different rules. Duplicate definitions
+of one TZID within a resource are rejected. Resources without a declaration keep
+the parser's timezone fallback behavior. The timezone interpretation correction
+invalidates older derived item-cache ranges in both cache modes; they rebuild on
+access without deleting calendar files or history/sync-token caches.
+
 ##### folder_umask
 
 _(>= 3.3.2)_

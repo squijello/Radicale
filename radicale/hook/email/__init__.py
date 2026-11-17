@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import vobject
 
+from radicale import item as radicale_item
 from radicale.hook import (BaseHook, HookNotificationItem,
                            HookNotificationItemTypes)
 from radicale.hook.email.scheduling import (PlannedMessage, build_itip_ics,
@@ -193,7 +194,7 @@ def read_ics_event(contents: str) -> Optional['Event']:
     """
     Read the vobject item from the provided string and create an Event.
     """
-    v_cal: vobject.base.Component = vobject.readOne(contents)
+    v_cal: vobject.base.Component = radicale_item.read_one(contents)
     cal: Calendar = Calendar(vobject_item=v_cal)
     return cal.event if cal.event else None
 
@@ -1044,7 +1045,7 @@ def _read_event(vobject_data: str) -> EmailEvent:
     """
     Read the vobject item from the provided string and create an EmailEvent.
     """
-    v_cal: vobject.base.Component = vobject.readOne(vobject_data)
+    v_cal: vobject.base.Component = radicale_item.read_one(vobject_data)
     cal: Calendar = Calendar(vobject_item=v_cal)
     event: Union[Event, None] = cal.event
 

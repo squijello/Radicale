@@ -57,7 +57,7 @@ Parsed items, history, and sync tokens can be cached under `.Radicale.cache/` in
 
 Each of `[storage] use_cache_subfolder_for_item`, `use_cache_subfolder_for_history`, and `use_cache_subfolder_for_synctoken` moves only that one subfolder. The moved path keeps the principal. A collection `user/calendar` is `{cache_root}/collection-cache/user/calendar/.Radicale.cache/{item|history|sync-token}`. `cache_root` is `[storage] filesystem_cache_folder` when that option is set, otherwise the storage folder. A flag that is false leaves that subfolder inside the collection: `{filesystem_folder}/collection-root/user/calendar/.Radicale.cache/{item|history|sync-token}`.
 
-`storage.CACHE_VERSION` mixes a Radicale cache-structure version (`CACHE_VERSION_RADICALE` in `radicale/storage/__init__.py`) with the installed `vobject` version. Only the item-cache hash and the mtime-and-size stamp include it. History pickles and sync-token pickles do not, so changing `CACHE_VERSION_RADICALE` does not invalidate those files.
+`storage.CACHE_VERSION` mixes a Radicale cache version (`CACHE_VERSION_RADICALE` in `radicale/storage/__init__.py`) with the installed `vobject` version. Change it when the layout or parsing semantics of derived values change: cached start/end times must be rebuilt when calendar-local timezone interpretation changes. Only the item-cache hash and the mtime-and-size stamp include it. History pickles and sync-token pickles do not, so changing `CACHE_VERSION_RADICALE` does not invalidate those files.
 
 `[storage] use_mtime_and_size_for_item_cache` lets a read skip opening the member file when the cache stamp still matches.
 

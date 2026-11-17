@@ -5,6 +5,7 @@
 # Copyright © 2008-2017 Guillaume Ayoub
 # Copyright © 2017-2022 Unrud <unrud@outlook.com>
 # Copyright © 2024-2026 Peter Bieringer <pb@bieringer.de>
+# Copyright © 2026-2026 Contributors to Radicale
 #
 # This library is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -33,8 +34,8 @@ import os
 import re
 from hashlib import sha256
 from itertools import chain
-from typing import (Any, Callable, List, MutableMapping, Optional, Sequence,
-                    Tuple, Union)
+from typing import (Any, Callable, Dict, List, MutableMapping, Optional,
+                    Sequence, Tuple, Union)
 
 import vobject
 
@@ -66,6 +67,196 @@ RRULE_FREQUENCIES_TO_INTERVAL: dict[str, float] = {
                                   }
 
 
+class _Calendar(vobject.base.Component):
+    """Keep calendar-local native timezone bindings intact during serialization."""
+
+    def copy(self, other):
+        super().copy(other)
+        object.__setattr__(self, "_local_zones", getattr(other, "_local_zones", None))
+
+    def serialize(self, buf=None, lineLength=75, validate=True, behavior=None,
+                  *args, **kwargs):
+        # vobject's serializer converts native values to text and then reparses
+        # them using its global TZID registry. Only a detached copy may do that.
+        return _calendar_to_text(self).serialize(
+            buf, lineLength, validate, behavior, *args, **kwargs)
+
+
+def _native_timezone_id(value: datetime.datetime) -> Optional[str]:
+    # Supported native tzinfo implementations carry their declared identifier.
+    # Never guess one from a display name or a matching UTC offset.
+    for attribute in ("tzid", "zone", "_tzid"):
+        identifier = getattr(value.tzinfo, attribute, None)
+        if isinstance(identifier, str):
+            return identifier
+    return None
+
+
+def _calendar_to_text(component: vobject.base.Component) -> vobject.base.Component:
+    """Make a detached, serializable tree without vobject's UTC heuristic.
+
+    vobject compares only historical offsets when deciding whether a timezone
+    is UTC. Explicit local values must retain their TZID even when later rules
+    differ. Already-native foreign components have no lexical UTC provenance;
+    their declared TZID denotes local wall time, except for force-UTC properties.
+    """
+    result = vobject.base.Component.duplicate(component)
+    defined = {zone.tzid.value for zone in component.contents.get("vtimezone", [])
+               if len(zone.contents.get("tzid", [])) == 1}
+    local_zones = getattr(component, "_local_zones", None)
+
+    def prepare(parent):
+        for line in parent.getChildren():
+            if isinstance(line, vobject.base.Component):
+                if line.name != "VTIMEZONE":
+                    prepare(line)
+                continue
+            if getattr(line.behavior, "forceUTC", False):
+                continue
+            values = line.value if isinstance(line.value, list) else [line.value]
+            if not values or not all(isinstance(value, datetime.datetime) for value in values):
+                continue
+            identifiers = line.params.get("TZID") or line.params.get("X-VOBJ-ORIGINAL-TZID", [])
+            native_ids = [_native_timezone_id(value) for value in values]
+            declared_ids = [identifier for identifier in native_ids if identifier in defined]
+            if declared_ids:
+                # Native .value edits can leave stale generated TZID metadata.
+                # Actual named zones take precedence over that old metadata.
+                identifiers = declared_ids[:1]
+            elif any(identifier is not None for identifier in native_ids) and len(set(native_ids)) == 1:
+                # A native edit may introduce an undeclared named zone. Let
+                # vobject add its declaration instead of reusing stale metadata
+                # or converting a recurring local start to a fixed UTC time.
+                line.params.pop("TZID", None)
+                line.params.pop("X-VOBJ-ORIGINAL-TZID", None)
+                continue
+            if len(identifiers) != 1 or not isinstance(identifiers[0], str) or identifiers[0] not in defined:
+                if not any(identifier is not None for identifier in native_ids) or len(set(native_ids)) == 1:
+                    continue
+                tzid = None
+            else:
+                tzid = identifiers[0]
+            if declared_ids:
+                all_local = all(identifier == tzid for identifier in native_ids)
+            elif any(identifier is not None for identifier in native_ids):
+                all_local = False
+            else:
+                all_local = tzid is not None and local_zones is None
+            if not all_local:
+                # A property has only one TZID. Mixed native zones must use
+                # UTC tokens to preserve every instant. Genuine UTC/floating
+                # values must not acquire a local TZID from stale parameters.
+                line.value = ",".join(vobject.icalendar.dateTimeToString(value, convertToUTC=True)
+                                      for value in values)
+                line.params.pop("TZID", None)
+                line.params.pop("X-VOBJ-ORIGINAL-TZID", None)
+                line.isNative = False
+                continue
+            line.value = ",".join(
+                ("%04d%02d%02dT%02d%02d%02d" % (value.year, value.month, value.day,
+                                                value.hour, value.minute, value.second))
+                for value in values)
+            line.params["TZID"] = [tzid]
+            line.params.pop("X-VOBJ-ORIGINAL-TZID", None)
+            line.isNative = False
+
+    prepare(result)
+    return result
+
+
+def _local_timezone_value(value: Any, text: str,
+                          zone: datetime.tzinfo) -> Any:
+    if isinstance(value, datetime.datetime):
+        # An explicit Z remains UTC even if an invalid TZID parameter is also
+        # present. Otherwise the declared zone applies to the local wall time.
+        return value if text.strip().endswith("Z") else value.replace(tzinfo=zone)
+    if isinstance(value, (list, tuple)):
+        parts = text.split("," if isinstance(value, list) else "/") if text else []
+        if len(parts) != len(value):
+            raise ValueError("Timezone value count differs from its source text")
+        values = [_local_timezone_value(part, raw, zone)
+                  for part, raw in zip(value, parts)]
+        return values if isinstance(value, list) else tuple(values)
+    return value
+
+
+def _has_native(component: vobject.base.Component) -> bool:
+    return bool(component.isNative) or any(
+        _has_native(child) if isinstance(child, vobject.base.Component) else child.isNative
+        for child in component.getChildren())
+
+
+def _to_native(component: vobject.base.Component) -> vobject.base.Component:
+    zones = component.contents.get("vtimezone", []) if component.name == "VCALENDAR" else []
+    if not zones:
+        component.transformChildrenToNative()
+        return component
+
+    # Own the component tree, including when a plugin supplies a native object.
+    # Recover actual TZID parameters and lexical UTC markers before transforming
+    # values; client-supplied X-VOBJ-ORIGINAL-TZID is not timezone authority.
+    if _has_native(component):
+        component = vobject.readOne(_calendar_to_text(component).serialize(), transform=False)
+    calendar = _Calendar.duplicate(component)
+    local_zones: Dict[str, datetime.tzinfo] = {}
+    for zone in calendar.contents["vtimezone"]:
+        identifiers = zone.contents.get("tzid", [])
+        if len(identifiers) != 1 or not identifiers[0].value:
+            raise ValueError("VTIMEZONE must contain one TZID")
+        tzid = identifiers[0].value
+        if tzid in local_zones:
+            raise ValueError("Duplicate VTIMEZONE TZID: %r" % tzid)
+        local_zones[tzid] = vobject.icalendar.TimezoneComponent.gettzinfo(zone)
+
+    pending: List[Tuple[Any, str, datetime.tzinfo]] = []
+
+    def collect(parent):
+        for child in parent.getChildren():
+            if isinstance(child, vobject.base.Component):
+                if child.name != "VTIMEZONE":
+                    collect(child)
+            else:
+                identifiers = child.params.get("TZID", [])
+                if len(identifiers) == 1 and isinstance(identifiers[0], str) and identifiers[0] in local_zones:
+                    pending.append((child, child.value, local_zones[identifiers[0]]))
+
+    collect(calendar)
+    calendar.transformChildrenToNative()
+    for line, text, zone in pending:
+        line.value = _local_timezone_value(line.value, text, zone)
+    object.__setattr__(calendar, "_local_zones", local_zones)
+    return calendar
+
+
+def read_one(s: str) -> vobject.base.Component:
+    """Parse one component with calendar-local declared timezone definitions."""
+    return _to_native(vobject.readOne(s, transform=False))
+
+
+def copy_calendar_timezones(source: vobject.base.Component,
+                            target: vobject.base.Component) -> vobject.base.Component:
+    """Preserve referenced declarations when a collection is split into items."""
+    referenced = set()
+
+    def collect(parent):
+        for line in parent.getChildren():
+            if isinstance(line, vobject.base.Component):
+                collect(line)
+            else:
+                referenced.update(value for value in (line.params.get("TZID") or
+                                  line.params.get("X-VOBJ-ORIGINAL-TZID", [])) if isinstance(value, str))
+
+    collect(target)
+    zones = [zone for zone in source.contents.get("vtimezone", []) if zone.tzid.value in referenced]
+    if not zones:
+        return target
+    calendar = _Calendar.duplicate(target)
+    object.__setattr__(calendar, "_local_zones", getattr(source, "_local_zones", None))
+    for zone in zones:
+        calendar.add(zone.duplicate(zone))
+    return calendar
+
+
 def read_components(s: str) -> List[vobject.base.Component]:
     """Wrapper for vobject.readComponents"""
     # Workaround for bug in InfCloud
@@ -82,9 +273,10 @@ def read_components(s: str) -> List[vobject.base.Component]:
     # Workaround delete all empty lines to avoid vobject parsing errors
     s = re.sub(r'(?m)^[ \t]*\r?\n', '', s)
     # Delete trailing space on TZID and TZNAME (Microsoft Outlook bug)
-    s = re.sub(r'(TZID|TZNAME)(:[^\r\n]+) (\r?\n)', r"\1\2\3", s)  # fix VTIMEZONE
-    s = re.sub(r'(TZID=[^:]+) (:)', r"\1\2", s)  # fix DTSTART/DTEND
-    return list(vobject.readComponents(s, allowQP=True))
+    s = re.sub(r'(TZID|TZNAME)(:[^\r\n]+) (\r?\n)(?![ \t])', r"\1\2\3", s)  # fix VTIMEZONE, not a folded value
+    s = re.sub(r'(TZID=[^:\r\n]+) (:)', r"\1\2", s)  # fix DTSTART/DTEND, same physical line only
+    return [_to_native(component) for component in
+            vobject.readComponents(s, allowQP=True, transform=False)]
 
 
 def predict_tag_of_parent_collection(
@@ -678,7 +870,9 @@ class Item:
         self.href = href
         self.last_modified = last_modified
         self._text = text
-        self._vobject_item = vobject_item
+        self._vobject_item = (_to_native(vobject_item) if vobject_item is not None and
+                              vobject_item.name == "VCALENDAR" and
+                              vobject_item.contents.get("vtimezone") else vobject_item)
         self._etag = etag
         self._uid = uid
         self._name = name
@@ -699,7 +893,8 @@ class Item:
     def vobject_item(self):
         if self._vobject_item is None:
             try:
-                self._vobject_item = vobject.readOne(self._text)
+                assert self._text is not None
+                self._vobject_item = read_one(self._text)
             except Exception as e:
                 raise RuntimeError("Failed to parse item %r from %r: %s" %
                                    (self.href, self._collection_path,

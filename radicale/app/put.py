@@ -92,6 +92,8 @@ def prepare(vobject_items: List[vobject.base.Component], path: str,
                     for component in components:
                         vobject_collection.add(component)
                     vobject_collection.add(vobject.base.ContentLine("PRODID", [], PRODID))
+                    vobject_collection = radicale_item.copy_calendar_timezones(
+                        vobject_item, vobject_collection)
                     item = radicale_item.Item(collection_path=collection_path,
                                               vobject_item=vobject_collection)
                     logger.debug("Prepare item with UID '%s'", item.uid)

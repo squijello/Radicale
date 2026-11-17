@@ -22,7 +22,7 @@ those messages as text/calendar parts listing only the
 recipient.
 
 Supported: single-VEVENT events only. A single VEVENT may
-define a recurring series with RRULE. Multi-VEVENT objects are
+define a recurring series with RRULE or RDATE. Multi-VEVENT objects are
 rejected with no messages; per-instance (RECURRENCE-ID)
 changes are not supported.
 
@@ -122,6 +122,7 @@ class EventInfo:
     # change here, because clients bump it on attendee-only edits too.
     details: Tuple
     status: Optional[str] = None
+    recurring: bool = False
 
 
 def parse_event(ics: Optional[str]) -> Optional[EventInfo]:
@@ -194,6 +195,7 @@ def parse_event(ics: Optional[str]) -> Optional[EventInfo]:
         organizer_schedule_agent=_first_param(event, "organizer", "SCHEDULE-AGENT"),
         attendees=attendees,
         status=raw("status"),
+        recurring=bool(_content_lines(event, "rrule") or _content_lines(event, "rdate")),
         details=details,
     )
 

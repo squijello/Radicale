@@ -1276,6 +1276,93 @@ class TestStoredSchedulingRevision(BaseTest):
                  login="jeff:password", http_if_match='"stale"')
 
 
+class TestRecurringSchedulingPastGuard(BaseTest):
+    """A master's first end does not prove that its series has finished."""
+
+    def setup_method(self):
+        TestHookWiring.setup_method(self)
+        self.mkcalendar("/calendar.ics/", login="jeff:password")
+        self.path = "/calendar.ics/recurring.ics"
+        self.start = datetime.now() - timedelta(days=14)
+
+    def _source(self, kind, all_day):
+        date_format = "%Y%m%d" if all_day else "%Y%m%dT%H%M%SZ"
+        end = self.start + (timedelta(days=1) if all_day else timedelta(hours=2))
+        source = _event([ALICE], dtstart=self.start.strftime(date_format),
+                        dtend=end.strftime(date_format))
+        if all_day:
+            source = source.replace("DTSTART:", "DTSTART;VALUE=DATE:").replace(
+                "DTEND:", "DTEND;VALUE=DATE:")
+        recurrence = {
+            "ongoing": "RRULE:FREQ=WEEKLY;COUNT=12",
+            "ended-count": "RRULE:FREQ=WEEKLY;COUNT=2",
+            "ended-until": ("RRULE:FREQ=WEEKLY;UNTIL=" +
+                            (self.start + timedelta(days=7)).strftime(date_format)),
+            "unbounded": "RRULE:FREQ=WEEKLY",
+            "rdate": (("RDATE;VALUE=DATE:" if all_day else "RDATE:") +
+                      (self.start + timedelta(days=21)).strftime(date_format)),
+            "none": "",
+        }[kind]
+        return source.replace("END:VEVENT", recurrence + "\nEND:VEVENT")
+
+    @pytest.mark.parametrize("kind", [
+        "ongoing", "ended-count", "ended-until", "unbounded", "rdate"])
+    @pytest.mark.parametrize("all_day", [False, True])
+    @pytest.mark.parametrize("change", ["add-attendee", "location"])
+    def test_series_edits_are_not_suppressed_by_first_end(
+            self, monkeypatch, kind, all_day, change):
+        sent = TestStoredSchedulingRevision._capture(self, monkeypatch)
+        source = self._source(kind, all_day)
+        self.put(self.path, source, login="jeff:password")
+        assert len(sent) == 1
+        sent.clear()
+        if change == "add-attendee":
+            updated = source.replace(
+                "END:VEVENT", "ATTENDEE;CN=Bob:mailto:bob@example.com\nEND:VEVENT")
+            recipient = "bob@example.com"
+        else:
+            updated = source.replace("LOCATION:Home", "LOCATION:Elsewhere")
+            recipient = "alice@example.com"
+        self.put(self.path, updated, check=204, login="jeff:password")
+        assert len(sent) == 1
+        assert sent[0].method.value == "REQUEST"
+        assert sent[0].vevent.attendee.value == "mailto:" + recipient
+        property_name = "rdate" if kind == "rdate" else "rrule"
+        assert property_name in sent[0].vevent.contents
+        sent.clear()
+        self.put(self.path, updated, check=204, login="jeff:password")
+        assert sent == []
+
+    @pytest.mark.parametrize("kind", ["ongoing", "rdate"])
+    @pytest.mark.parametrize("all_day", [False, True])
+    def test_removing_recurrence_still_updates_attendees(
+            self, monkeypatch, kind, all_day):
+        sent = TestStoredSchedulingRevision._capture(self, monkeypatch)
+        source = self._source(kind, all_day)
+        self.put(self.path, source, login="jeff:password")
+        sent.clear()
+        updated = vobject.readOne(source)
+        property_name = "rdate" if kind == "rdate" else "rrule"
+        del updated.vevent.contents[property_name]
+        self.put(self.path, updated.serialize(), check=204, login="jeff:password")
+        assert len(sent) == 1
+        assert sent[0].method.value == "REQUEST"
+        assert sent[0].vevent.attendee.value == "mailto:alice@example.com"
+        assert property_name not in sent[0].vevent.contents
+
+    @pytest.mark.parametrize("itip,kind", [(True, "none"), (False, "ongoing")])
+    @pytest.mark.parametrize("all_day", [False, True])
+    def test_ordinary_and_legacy_past_event_guards_are_preserved(
+            self, monkeypatch, itip, kind, all_day):
+        sent = TestStoredSchedulingRevision._capture(self, monkeypatch)
+        self.configure({"hook": {"itip_enabled": str(itip)}})
+        source = self._source(kind, all_day)
+        self.put(self.path, source, login="jeff:password")
+        updated = source.replace("LOCATION:Home", "LOCATION:Elsewhere")
+        self.put(self.path, updated, check=204, login="jeff:password")
+        assert sent == []
+
+
 def _email_config(**kwargs):
     from radicale.hook.email import EmailConfig, MessageTemplate
     options = dict(host="smtp.example.com", port=587, security="starttls",

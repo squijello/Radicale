@@ -2302,8 +2302,17 @@ Requires the email hook (`type = email`), SMTP configuration, and a non-empty
 be used with `mass_email = True`.
 
 Only resources containing a single `VEVENT` are supported, including recurring
-masters using `RRULE`. Recurrence overrides with multiple `VEVENT` components
-are not supported. This is not a complete CalDAV scheduling implementation:
+masters using `RRULE` or `RDATE`. The first occurrence's end does not suppress
+iTIP notifications for a recurring master. If either the previous or new event
+has recurrence, organizer changes are considered even when the first occurrence
+is in the past, including removal of the recurrence property. The hook does not
+expand the series to prove that all occurrences have ended, so an edit to a
+finite, already-ended series can still generate a scheduling message. Unchanged
+saves still send nothing. Ordinary past-event and legacy notification guards
+retain their existing behavior.
+
+Recurrence overrides with multiple `VEVENT` components are not supported.
+This is not a complete CalDAV scheduling implementation:
 incoming attendee replies and RFC 6638 inbox/outbox handling are not provided.
 SMTP delivery is best-effort, without a persistent queue or retries; an
 unchanged resave will not retry an email lost to a delivery failure.

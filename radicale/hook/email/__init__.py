@@ -1175,8 +1175,8 @@ class Hook(BaseHook):
             organizer_is_username=self.email_config.itip_organizer_is_username)
 
     # Shared event processing. The iTIP and legacy paths share
-    # notification-type parsing, event reading, and past-event
-    # checking, but not their sending rules: legacy keeps its
+    # notification-type parsing and event reading, but iTIP does
+    # not infer a series end from its first occurrence. Legacy keeps its
     # unparseable-previous-event fallback to send_added, while
     # iTIP sends nothing when the previous event cannot be parsed.
 
@@ -1219,7 +1219,7 @@ class Hook(BaseHook):
         if not email_event or not email_event.event:
             logger.error("Failed to read event from new content: %s", new_item_str)
             return None
-        if self._is_past_event(email_event):
+        if not self.email_config.itip_enabled and self._is_past_event(email_event):
             return None
         return new_item_str, previous_item_str, email_event
 
@@ -1260,9 +1260,6 @@ class Hook(BaseHook):
             return
 
     def _process_itip_upsert(self, notification_item, new_item_str, previous_item_str, email_event) -> None:
-        if not previous_item_str:
-            logger.info("New event detected, sending notifications to all attendees: %s",
-                        email_event.event.uid)
         owner_identities = self._owner_identities(notification_item)
         new_parsed = parse_event(new_item_str)
         if new_parsed is not None and not check_ownership(
@@ -1272,11 +1269,22 @@ class Hook(BaseHook):
                          new_parsed.organizer_email, owner_identities,
                          email_event.event.uid)
             return
-        if previous_item_str and parse_event(previous_item_str) is None:
+        old_parsed = parse_event(previous_item_str)
+        if previous_item_str and old_parsed is None:
             logger.error("Previous event content could not be parsed, "
                          "sending no scheduling messages for event: %s",
                          email_event.event.uid)
             return
+        # DTEND describes the first occurrence. Avoid expanding potentially
+        # unbounded rules here; changes to a series must still be delivered,
+        # including removal of its last recurrence property.
+        recurring = any(event is not None and event.recurring
+                        for event in (old_parsed, new_parsed))
+        if not recurring and self._is_past_event(email_event):
+            return
+        if not previous_item_str:
+            logger.info("New event detected, sending notifications to all attendees: %s",
+                        email_event.event.uid)
         planned = plan_messages(previous_item_str, new_item_str,
                                 owner_identities=owner_identities)
         self._send_planned(planned, email_event, previous_item_str, new_item_str,

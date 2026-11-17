@@ -2287,6 +2287,26 @@ does not send another message.
 Attendees with `SCHEDULE-AGENT=CLIENT` or `SCHEDULE-AGENT=NONE` do not receive
 server-generated messages.
 
+Email scheduling supports ASCII mailbox addresses with an unquoted local part
+and a DNS domain with at least two labels. Percent escapes in complete
+`mailto:` calendar addresses are decoded once: `mailto:alice%2Btag@example.com` identifies
+`alice+tag@example.com`. URI queries, fragments, malformed escapes and embedded
+`mailto:` text are not accepted as recipients or organizer identities. Bare
+configured mailbox values retain literal percent characters; for example,
+`alice%2Btag@example.com` is a different mailbox from `alice+tag@example.com`.
+The principal's `calendar-user-address-set` escapes configured mailbox values
+when advertising their `mailto:` URIs.
+
+An iTIP event must have one organizer and distinct attendee mailbox identities.
+Every `ORGANIZER` and `ATTENDEE` must contain a complete supported `mailto:` URI
+with the default `CAL-ADDRESS` value type. Bare addresses, duplicate identities,
+other value types, and `DELEGATED-FROM`, `DELEGATED-TO`, `SENT-BY` or `MEMBER`
+parameters make the whole event unsupported for this iTIP path. An unsupported
+previous or new event produces no scheduling messages or server revision
+adjustments; its attendees are not treated as removed. These whole-event
+eligibility rules apply only to iTIP; legacy notifications can still use
+supported bare mailbox values.
+
 Changing an existing attendee's `RSVP` from absent or `FALSE` to `TRUE` sends
 that attendee a `REQUEST` for reconfirmation. An unchanged `RSVP=TRUE` does not
 repeat the request. Changes to an attendee's `ROLE` send that attendee an
@@ -2362,10 +2382,13 @@ Patterns are matched case-insensitively against the **whole** username (implicit
 specific rules before catch-all rules. Replacements use `{1}`, `{2}`, etc. for
 capture groups and `{0}` for the whole username, not backslash references.
 Double braces (`{{` and `}}`) represent literal braces in replacement strings.
-Invalid regexes or replacement references are configuration errors. An expanded
-value that is not a single email address grants no mapped identity and supplies
-no Reply-To. The same rules supply ownership, principal addresses, and, when
-enabled, `itip_owner_reply_to`.
+Invalid regexes or replacement references are configuration errors. Literal
+addresses and expanded templates must be supported bare ASCII mailboxes with
+an unquoted local part and a DNS domain with at least two labels. `mailto:` URIs
+are not configuration values. Percent characters in the resulting mailbox remain literal. An invalid
+expanded value grants no mapped identity and supplies no Reply-To, without
+falling through to another rule. The same rules supply ownership, principal
+addresses, and, when enabled, `itip_owner_reply_to`.
 
 Examples when the authenticated username still contains its domain:
 
@@ -2447,9 +2470,9 @@ Default: `False`
 
 _(>= 3.9.1)_
 
-When enabled, an authenticated user whose username is an email address
-(one `@`, non-empty local part and domain, no whitespace) owns that address
-as `ORGANIZER`, compared case-insensitively, without an `itip_owner_map`
+When enabled, an authenticated user whose username is a supported bare ASCII
+mailbox (an unquoted local part and a DNS domain with at least two labels) owns
+that address as `ORGANIZER`, compared case-insensitively, without an `itip_owner_map`
 entry. A username that is not an email address gets nothing from this
 setting. It can be combined with `itip_owner_map`: a user then owns both the
 mapped address and the username address. With this setting enabled,

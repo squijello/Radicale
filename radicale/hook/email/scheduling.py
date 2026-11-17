@@ -40,6 +40,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from urllib.parse import unquote_to_bytes, urlsplit
 
 import vobject
 from dateutil.tz import tzutc
@@ -62,22 +63,78 @@ __all__ = [
 ]
 
 MAX_SEQUENCE = 2147483647
+_LOCAL_PART = re.compile(r"[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*")
+_DOMAIN_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_UNSUPPORTED_IDENTITY_PARAMETERS = frozenset(("DELEGATED-FROM", "DELEGATED-TO", "SENT-BY", "MEMBER"))
+
+
+def _normalize_mailbox(address: str) -> Optional[str]:
+    """Validate a supported bare mailbox without decoding URI escapes."""
+    if not address.isascii():
+        return None
+    address = address.lower()
+    if len(address) > 254 or address.count("@") != 1:
+        return None
+    local, domain = address.split("@")
+    if len(local) > 64 or not _LOCAL_PART.fullmatch(local):
+        return None
+    labels = domain.split(".")
+    if len(labels) < 2 or any(not _DOMAIN_LABEL.fullmatch(label) for label in labels):
+        return None
+    return address
 
 
 def extract_email(value: Optional[str]) -> Optional[str]:
-    """Extract a lower-cased email address from a calendar-user value."""
-    if not value:
+    """Normalize an ASCII mailbox or complete mailto calendar-user URI.
+
+    URI percent escapes are decoded exactly once. A bare mailbox already
+    describes its identity, so percent characters there remain literal.
+    Quoted local parts and internationalized addresses are not supported.
+    """
+    if not isinstance(value, str) or not value.isascii():
         return None
-    value = value.strip().lower()
-    match = re.search(r"mailto:([^;]+)", value)
-    if match:
-        return match.group(1)
-    return value if "@" in value else None
+    address = value.strip()
+    if address.lower().startswith("mailto:"):
+        if address != value or any(ord(char) <= 32 or ord(char) == 127 for char in value):
+            return None
+        try:
+            uri = urlsplit(value)
+            if (uri.scheme.lower() != "mailto" or uri.netloc or "?" in value or "#" in value or
+                    re.search(r"%(?![0-9a-fA-F]{2})", uri.path)):
+                return None
+            address = unquote_to_bytes(uri.path).decode("ascii")
+        except (ValueError, UnicodeError):
+            return None
+    return _normalize_mailbox(address)
 
 
 def _content_lines(component, name: str):
     lines = component.contents.get(name.lower(), [])
     return lines if isinstance(lines, (list, tuple)) else [lines]
+
+
+def _supports_email_identities(event) -> bool:
+    """Require complete mailto identities throughout a supported iTIP event."""
+    if len(_content_lines(event, "organizer")) != 1:
+        return False
+    attendee_emails = set()
+    for name in ("organizer", "attendee"):
+        for line in _content_lines(event, name):
+            if not isinstance(line, vobject.base.ContentLine):
+                return False
+            value = line.value
+            if not isinstance(value, str) or not value.lower().startswith("mailto:"):
+                return False
+            address = extract_email(value)
+            if address is None or _UNSUPPORTED_IDENTITY_PARAMETERS.intersection(line.params):
+                return False
+            if [str(value).upper() for value in line.params.get("VALUE", ["CAL-ADDRESS"])] != ["CAL-ADDRESS"]:
+                return False
+            if name == "attendee":
+                if address in attendee_emails:
+                    return False
+                attendee_emails.add(address)
+    return True
 
 
 def _first_value(component, name: str):
@@ -160,6 +217,7 @@ class EventInfo:
     details: Tuple
     status: Optional[str] = None
     recurring: bool = False
+    supported_identities: bool = True
 
 
 def parse_event(ics: Optional[str]) -> Optional[EventInfo]:
@@ -168,6 +226,9 @@ def parse_event(ics: Optional[str]) -> Optional[EventInfo]:
     The master is the first VEVENT without a RECURRENCE-ID. If
     every VEVENT has one, there is no master to diff, so return
     None rather than diffing an override as if it were the master.
+    Unsupported organizer or attendee identities mark the whole event
+    ineligible for scheduling; dropping one line could falsely infer an
+    attendee removal. UID lookup can still inspect an ineligible event.
     """
     if not ics:
         return None
@@ -225,7 +286,7 @@ def parse_event(ics: Optional[str]) -> Optional[EventInfo]:
         _recurrence_properties(event, "rdate"),
         _recurrence_properties(event, "exdate"),
         raw("recurrence-id"),
-        organizer_value,
+        extract_email(organizer_value),
     )
     return EventInfo(
         uid=raw("uid"),
@@ -235,6 +296,7 @@ def parse_event(ics: Optional[str]) -> Optional[EventInfo]:
         attendees=attendees,
         status=raw("status"),
         recurring=bool(_content_lines(event, "rrule") or _content_lines(event, "rdate")),
+        supported_identities=_supports_email_identities(event),
         details=details,
     )
 
@@ -301,8 +363,8 @@ def _owner_rule(pattern: str, template: str) -> re.Pattern:
                     int(field) > regex.groups or spec or conversion):
                 raise ValueError("expected {0} through {%d}" % regex.groups)
         sample = template.format(*(["group"] * (regex.groups + 1)))
-        if not has_fields and not _USERNAME_EMAIL.fullmatch(sample):
-            raise ValueError("expected a single email address")
+        if not has_fields and _normalize_mailbox(sample) is None:
+            raise ValueError("expected a supported bare email address")
     except (re.error, ValueError, IndexError, KeyError) as e:
         raise ValueError("invalid itip_owner_map rule %r: %s" % (pattern, e)) from e
     return regex
@@ -319,20 +381,15 @@ def mapped_owner_email(actor: Optional[str],
         if match:
             address = template.format(match.group(0), *(
                 group or "" for group in match.groups())).strip().lower()
-            return address if _USERNAME_EMAIL.fullmatch(address) else None
+            return _normalize_mailbox(address)
     return None
 
 
-# One "@" with a non-empty local part and domain, no whitespace.
-_USERNAME_EMAIL = re.compile(r"[^@\s]+@[^@\s]+")
-
-
 def username_email(actor: Optional[str]) -> Optional[str]:
-    """The lower-cased email address an actor's username is, or None."""
+    """The supported bare mailbox an actor's username is, or None."""
     if not actor:
         return None
-    actor = actor.strip().lower()
-    return actor if _USERNAME_EMAIL.fullmatch(actor) else None
+    return _normalize_mailbox(actor.strip())
 
 
 def resolve_owner_identities(actor: Optional[str],
@@ -441,13 +498,13 @@ def plan_messages(old_ics: Optional[str], new_ics: Optional[str],
     ``deleted=True`` only ``old_ics`` is used and every eligible
     attendee of an active event gets a CANCEL. An empty list means
     nothing is sent: a repeated save, an unproved organizer, an unparseable
-    previous event, or a rejected multi-VEVENT object. The
-    caller logs the unproved-ownership and unparseable cases.
+    previous event, unsupported identities, or a rejected multi-VEVENT object.
+    The email hook logs unsupported uploads and ownership mismatches.
     """
     new_event = None if deleted else parse_event(new_ics)
     if deleted:
         old_event = parse_event(old_ics)
-        if old_event is None:
+        if old_event is None or not old_event.supported_identities:
             return []
         if _vevent_count(old_ics) > 1:
             return []
@@ -458,7 +515,7 @@ def plan_messages(old_ics: Optional[str], new_ics: Optional[str],
         return [PlannedMessage("CANCEL", a.email, a.name, "deleted")
                 for a in old_event.attendees.values()
                 if _eligible(old_event, a)]
-    if new_event is None:
+    if new_event is None or not new_event.supported_identities:
         return []
     if not check_ownership(new_event.organizer_email, owner_identities):
         return []
@@ -471,8 +528,8 @@ def plan_messages(old_ics: Optional[str], new_ics: Optional[str],
                 for a in new_event.attendees.values()
                 if _eligible(new_event, a)]
     old_event = parse_event(old_ics)
-    if old_event is None:
-        # Without a previous event there is nothing to diff against.
+    if old_event is None or not old_event.supported_identities:
+        # A usable prior identity set is needed to infer membership changes.
         return []
     # Do not infer changes across different events or organizers.
     if not old_event.uid or old_event.uid != new_event.uid:
@@ -552,7 +609,8 @@ def prepare_itip_upload(old_ics: Optional[str], new_ics: str,
     the same revision space. Unsupported objects are left unchanged.
     """
     new_event = parse_event(new_ics)
-    if (new_event is None or _vevent_count(new_ics) != 1 or
+    if (new_event is None or not new_event.supported_identities or
+            _vevent_count(new_ics) != 1 or
             not check_ownership(new_event.organizer_email, owner_identities)):
         return None
     calendar = vobject.readOne(new_ics)
@@ -560,7 +618,8 @@ def prepare_itip_upload(old_ics: Optional[str], new_ics: str,
     if old_ics is None:
         return None
     old_event = parse_event(old_ics)
-    if (old_event is None or _vevent_count(old_ics) != 1 or
+    if (old_event is None or not old_event.supported_identities or
+            _vevent_count(old_ics) != 1 or
             old_event.uid != new_event.uid or
             old_event.organizer_email != new_event.organizer_email):
         return None
@@ -601,7 +660,8 @@ def build_itip_ics(source_ics: str, method: str, recipient_email: str,
 
     A multi-VEVENT source raises ValueError, matching the
     planner's rejection; the builder enforces the restriction
-    independently.
+    independently. Unsupported or ambiguous organizer/attendee identities
+    also reject the whole source before any per-recipient filtering.
 
     Revision handling (RFC 5546, RFC 6638 section 3.2.5):
     DTSTAMP is set to generation time. For REQUEST, SEQUENCE is
@@ -627,6 +687,8 @@ def build_itip_ics(source_ics: str, method: str, recipient_email: str,
     now = datetime.now(tzutc())
     found_recipient = False
     for event in vevents:
+        if not _supports_email_identities(event):
+            raise ValueError("unsupported or ambiguous scheduling identity")
         source_sequence = _event_sequence(event)
         # DTSTAMP: time this message is generated.
         dtstamp_lines = _content_lines(event, "dtstamp")

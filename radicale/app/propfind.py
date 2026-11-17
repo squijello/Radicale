@@ -27,6 +27,7 @@ import xml.etree.ElementTree as ET
 from http import client
 from typing import (Dict, Iterable, Iterator, List, Optional, Sequence, Tuple,
                     Union, cast)
+from urllib.parse import quote
 
 from radicale import (httputils, pathutils, rights, sharing, storage, types,
                       utils, xmlutils)
@@ -273,7 +274,7 @@ def xml_propfind_response(
                         self.configuration.get("hook", "itip_owner_map"),
                         self.configuration.get("hook", "itip_organizer_is_username")):
                     child_element = ET.Element(xmlutils.make_clark("D:href"))
-                    child_element.text = "mailto:" + address
+                    child_element.text = "mailto:" + quote(address, safe="@")
                     element.append(child_element)
             child_element = ET.Element(xmlutils.make_clark("D:href"))
             child_element.text = xmlutils.make_href(base_prefix, path)

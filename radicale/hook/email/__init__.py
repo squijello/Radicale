@@ -38,7 +38,7 @@ from radicale.hook import (BaseHook, HookNotificationItem,
                            HookNotificationItemTypes)
 from radicale.hook.email.scheduling import (PlannedMessage, build_itip_ics,
                                             build_itip_message,
-                                            check_ownership,
+                                            check_ownership, extract_email,
                                             mapped_owner_email, parse_event,
                                             parse_owner_map, plan_messages,
                                             prepare_itip_upload,
@@ -205,18 +205,6 @@ def ics_contents_contains_event(contents: str):
     :return: True if the ICS file contains an event, False otherwise.
     """
     return read_ics_event(contents) is not None
-
-
-def extract_email(value: str) -> Optional[str]:
-    """Extract email address from a string."""
-    if not value:
-        return None
-    value = value.strip().lower()
-    match = re.search(r"mailto:([^;]+)", value)
-    if match:
-        return match.group(1)
-    # Fallback to the whole value if no mailto found
-    return value if "@" in value else None
 
 
 def determine_added_removed_and_unaltered_attendees(original_event: 'Event',
@@ -1278,7 +1266,11 @@ class Hook(BaseHook):
     def _process_itip_upsert(self, notification_item, new_item_str, previous_item_str, email_event) -> None:
         owner_identities = self._owner_identities(notification_item)
         new_parsed = parse_event(new_item_str)
-        if new_parsed is not None and not check_ownership(
+        if new_parsed is None or not new_parsed.supported_identities:
+            logger.warning("New event content is unsupported for scheduling, "
+                           "sending no messages for event: %s", email_event.event.uid)
+            return
+        if not check_ownership(
                 new_parsed.organizer_email, owner_identities):
             logger.error("Organizer %r does not match owner identities %r, "
                          "skipping scheduling messages (attendee copy?) for event: %s",
@@ -1286,8 +1278,8 @@ class Hook(BaseHook):
                          email_event.event.uid)
             return
         old_parsed = parse_event(previous_item_str)
-        if previous_item_str and old_parsed is None:
-            logger.error("Previous event content could not be parsed, "
+        if previous_item_str and (old_parsed is None or not old_parsed.supported_identities):
+            logger.error("Previous event content is unsupported for scheduling, "
                          "sending no scheduling messages for event: %s",
                          email_event.event.uid)
             return

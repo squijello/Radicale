@@ -11,15 +11,7 @@
 # GNU General Public License for more details.
 # If not, see <http://www.gnu.org/licenses/>.
 
-"""Tests for server-side scheduling delivery in the email hook.
-
-These tests cover the symptom that motivated the change: adding
-one attendee to an existing event must not re-notify the attendees
-who were already there. They test the pure planner in
-``radicale.hook.email.scheduling`` directly, plus one end-to-end
-PUT through the Radicale test harness with the hook in dry-run
-mode, so a regression in the hook wiring is caught as well.
-"""
+"""Scheduling decisions, outgoing MIME and real calendar write integration."""
 
 import base64
 import logging
@@ -30,7 +22,8 @@ import pytest
 import vobject
 
 from radicale.hook.email.scheduling import (build_itip_ics, build_itip_message,
-                                            check_ownership, plan_messages)
+                                            check_ownership, extract_email,
+                                            plan_messages)
 from radicale.tests import BaseTest
 
 OWNER = ["jeff@example.com"]
@@ -62,6 +55,143 @@ CAROL = ("Carol", "carol@example.com", "")
 
 def _recipients(planned):
     return [(p.method, p.recipient_email, p.kind) for p in planned]
+
+
+def _unsupported_identity_cases():
+    cases = []
+    fields = [("organizer", "ORGANIZER;CN=Jeff", "jeff@example.com"),
+              ("attendee", "ATTENDEE;CN=Alice", "alice@example.com"),
+              ("other-attendee", "ATTENDEE;CN=Bob", "bob@example.com")]
+    for label, prefix, address in fields:
+        original = prefix + ":mailto:" + address
+        cases.append((label + "-bare", original, prefix + ":" + address))
+        cases.append((label + "-query", original, original + "?subject=extra"))
+        for parameter in ("VALUE=TEXT", "VALUE=CAL-ADDRESS,CAL-ADDRESS",
+                          'DELEGATED-FROM="mailto:delegate@example.com"',
+                          'DELEGATED-TO="mailto:delegate@example.com"',
+                          'SENT-BY="mailto:delegate@example.com"',
+                          'MEMBER="mailto:group@example.com"'):
+            cases.append((label + "-" + parameter.split("=")[0], original,
+                          prefix + ";" + parameter + ":mailto:" + address))
+    attendee = "ATTENDEE;CN=Alice:mailto:alice@example.com"
+    cases.extend([
+        ("duplicate-attendee", attendee, attendee + "\n" + attendee),
+        ("encoded-duplicate-attendee", attendee,
+         attendee + "\nATTENDEE;CN=Alias:mailto:%61LICE@EXAMPLE.COM"),
+        ("duplicate-organizer", fields[0][1] + ":mailto:" + fields[0][2],
+         (fields[0][1] + ":mailto:" + fields[0][2] + "\n") * 2),
+    ])
+    return cases
+
+
+class TestCalendarIdentityEligibility:
+    @pytest.mark.parametrize("case,original,replacement", _unsupported_identity_cases())
+    def test_unsupported_identity_makes_whole_itip_event_ineligible(self, case, original, replacement):
+        from radicale.hook.email.scheduling import (parse_event,
+                                                    prepare_itip_upload)
+
+        source = _event([ALICE, BOB], sequence=5)
+        unsupported = source.replace(original, replacement).replace(
+            "SEQUENCE:5", "SEQUENCE:1").replace("LOCATION:Home", "LOCATION:Away")
+        parsed = parse_event(unsupported)
+        assert parsed is not None and parsed.uid == "pizza-1", case
+        assert plan(None, unsupported) == []
+        assert plan(source, unsupported) == []
+        assert plan(unsupported, source) == []
+        assert plan(unsupported, None, deleted=True) == []
+        assert prepare_itip_upload(source, unsupported, OWNER) is None
+        assert prepare_itip_upload(unsupported, source, OWNER) is None
+        for method in ("REQUEST", "CANCEL"):
+            with pytest.raises(ValueError, match="identity"):
+                build_itip_ics(unsupported, method, "alice@example.com")
+
+    def test_literal_percent_and_plus_are_distinct_attendees(self):
+        source = _event([("Literal", "alice%252Btag@example.com", ";VALUE=cal-address"),
+                         ("Plus", "alice%2Btag@example.com", ";VALUE=CAL-ADDRESS")])
+        assert [message.recipient_email for message in plan(None, source)] == [
+            "alice%2btag@example.com", "alice+tag@example.com"]
+
+
+class TestCalendarEmailAddresses:
+    @pytest.mark.parametrize("value,expected", [
+        ("mailto:Alice%2BTag@EXAMPLE.COM", "alice+tag@example.com"),
+        ("MAILTO:Alice+Tag@EXAMPLE.COM", "alice+tag@example.com"),
+        ("mailto:alice%25tag@example.com", "alice%tag@example.com"),
+        ("mailto:alice%252Btag@example.com", "alice%2btag@example.com"),
+        ("mailto:alice%3Ftag@example.com", "alice?tag@example.com"),
+        ("mailto:alice%23tag@example.com", "alice#tag@example.com"),
+        ("mailto:%61lice%40example.com", "alice@example.com"),
+        ("mailto:alice%2Ftag@example.com", "alice/tag@example.com"),
+        (" alice%2Btag@example.com ", "alice%2btag@example.com"),
+        ("alice%tag@example.com", "alice%tag@example.com"),
+        ("Alice+Tag@Example.com", "alice+tag@example.com"),
+    ])
+    def test_mailto_decodes_once_and_bare_mailbox_percent_is_literal(self, value, expected):
+        from radicale.hook.email import extract_email as legacy_extract_email
+
+        assert extract_email(value) == expected
+        assert legacy_extract_email(value) == expected
+
+    @pytest.mark.parametrize("value", [
+        None, "", "mailto:",
+        "mailto:alice@example.com?subject=invitation", "mailto:alice@example.com?",
+        "mailto:alice@example.com#fragment", "mailto:alice@example.com#",
+        "mailto://alice@example.com", "prefix mailto:alice@example.com",
+        "urn:mailto:alice@example.com", "https://example.com/mailto:alice@example.com",
+        "mailto:mailto:alice@example.com", "mailto:alice%2@example.com",
+        "mailto:alice%gg@example.com", "mailto:alice%20tag@example.com",
+        "mailto:alice@example.com%20", "mailto:alice%0D%0Atag@example.com",
+        " mailto:alice@example.com", "mailto:alice@example.com ",
+        "mailto:álîce@example.com", "mailto:alice%FF@example.com",
+        "mailto:alice@example..com", "mailto:.alice@example.com",
+        "mailto:alice@example.com,other@example.com",
+        "mailto:alice@example.com;other@example.com",
+    ])
+    def test_unsupported_or_malformed_calendar_address_is_not_a_recipient(self, value):
+        from radicale.hook.email import extract_email as legacy_extract_email
+
+        assert extract_email(value) is None
+        assert legacy_extract_email(value) is None
+
+    @pytest.mark.parametrize("address,uri", [
+        ("jeff%2Btag@example.com", "mailto:jeff%252Btag@example.com"),
+        ("jeff%tag@example.com", "mailto:jeff%25tag@example.com"),
+        ("jeff+tag@example.com", "mailto:jeff%2Btag@example.com"),
+        ("jeff?tag@example.com", "mailto:jeff%3Ftag@example.com"),
+        ("jeff#tag@example.com", "mailto:jeff%23tag@example.com"),
+    ])
+    def test_owner_configuration_and_username_keep_bare_identity(self, address, uri):
+        from radicale.hook.email.scheduling import (parse_owner_map,
+                                                    resolve_owner_identities,
+                                                    username_email)
+
+        owner_map = parse_owner_map({"jeff": address})
+        assert owner_map == {"jeff": address.lower()}
+        assert username_email(address) == address.lower()
+        owner = resolve_owner_identities("jeff", owner_map)
+        assert owner == [address.lower()]
+        source = _event([ALICE]).replace("mailto:jeff@example.com", uri)
+        assert _recipients(plan(None, source, owner=owner)) == [
+            ("REQUEST", "alice@example.com", "created")]
+
+    @pytest.mark.parametrize("encoded,literal", [("alice%2Btag", "alice+tag"), ("%61lice", "alice")])
+    def test_equivalent_mailto_spelling_does_not_reinvite_attendee(self, encoded, literal):
+        source = _event([("Alice", encoded + "@example.com", "")])
+        updated = source.replace("mailto:" + encoded + "@example.com",
+                                 "mailto:" + literal + "@example.com")
+        assert plan(source, updated) == []
+
+    @pytest.mark.parametrize("original", [
+        "MAILTO:JEFF@EXAMPLE.COM", "mailto:j%65ff@example.com"])
+    def test_equivalent_organizer_uri_does_not_notify_or_advance_revision(self, original):
+        from radicale.hook.email.scheduling import prepare_itip_upload
+
+        source = _event([ALICE]).replace("mailto:jeff@example.com", original)
+        assert _recipients(plan(None, source)) == [
+            ("REQUEST", "alice@example.com", "created")]
+        updated = source.replace(original, "mailto:jeff@example.com")
+        assert plan(source, updated) == []
+        assert prepare_itip_upload(source, updated, OWNER) is None
 
 
 class TestPlanMessages:
@@ -653,6 +783,44 @@ class TestReplyToEndToEnd(BaseTest):
         self._assert_call(5, reply_to="jeff@reply.example", method="CANCEL",
                           recipient="alice@example.com", sequence=4)
 
+    @pytest.mark.parametrize("template,organizer,reply_to", [
+        ("{1}+tag@example.com", "mailto:jeff%2Btag@example.com", "jeff+tag@example.com"),
+        ("{1}%2Btag@example.com", "mailto:jeff%252Btag@example.com", "jeff%2btag@example.com"),
+    ])
+    def test_regex_owner_reply_to_uses_bare_mailbox_after_expansion(
+            self, monkeypatch, template, organizer, reply_to):
+        import json
+
+        self._configure(owner_map=json.dumps({"(jeff)": template}))
+        self._install_smtp(monkeypatch)
+        self.mkcalendar("/calendar.ics/", login="jeff:password")
+        path = "/calendar.ics/encoded-owner.ics"
+        source = self._future_event([ALICE], datetime.now() + timedelta(days=2)).replace(
+            "mailto:jeff@example.com", organizer)
+        self.put(path, source, login="jeff:password")
+        self._assert_call(0, reply_to=reply_to, method="REQUEST",
+                          recipient="alice@example.com", sequence=1)
+        # A different URI spelling for the same organizer is not an update.
+        equivalent = source.replace(organizer, organizer.replace("jeff", "j%65ff"))
+        self.put(path, equivalent, check=204, login="jeff:password")
+        assert len(self.calls) == 1
+        _, _, stored = self.request("GET", path, check=200, login="jeff:password")
+        assert int(vobject.readOne(stored).vevent.sequence.value) == 1
+
+    def test_invalid_first_map_expansion_omits_reply_to_without_fallback(self, monkeypatch):
+        import json
+
+        self._configure(owner_map=json.dumps({
+            "(.+)": "{1}?subject=extra", ".*": "fallback@example.com"}), username=True)
+        self._install_smtp(monkeypatch)
+        login = "jeff@example.com:password"
+        self.mkcalendar("/calendar.ics/", login=login)
+        source = self._future_event([ALICE], datetime.now() + timedelta(days=2))
+        self.put("/calendar.ics/invalid-map.ics", source, login=login)
+        assert len(self.calls) == 1
+        self._assert_call(0, reply_to=None, method="REQUEST",
+                          recipient="alice@example.com", sequence=1)
+
     def test_omitted_and_false_flag_emit_no_reply_to(self, monkeypatch):
         from email import message_from_string, policy
 
@@ -858,6 +1026,29 @@ class TestOwnerMapAndRecurrence:
         # An invalid first match must not fall through to a broader rule.
         rules = {"(.+)": "{1}@bad@example.com", "alice": "safe@example.com"}
         assert resolve_owner_identities("alice", rules) == []
+
+    @pytest.mark.parametrize("address", [
+        "mailto:jeff@example.com", ".jeff@example.com", "jeff@example..com",
+        "jeff@localhost", '"jeff"@example.com', "jeff@-example.com",
+        "jeff@exam_ple.com", "jéff@example.com", "a" * 65 + "@example.com",
+        "jeff\r\nextra@example.com",
+    ])
+    def test_owner_outputs_require_supported_bare_mailboxes(self, address):
+        import json
+
+        from radicale.hook.email.scheduling import (mapped_owner_email,
+                                                    owner_addresses,
+                                                    parse_owner_map,
+                                                    resolve_owner_identities,
+                                                    username_email)
+
+        with pytest.raises(ValueError, match="invalid itip_owner_map rule"):
+            parse_owner_map({"jeff": address})
+        rules = parse_owner_map({r"([\s\S]+)": "{1}", ".*": "fallback@example.com"})
+        assert mapped_owner_email(address, rules) is None
+        assert username_email(address) is None
+        assert resolve_owner_identities(address, rules, True) == []
+        assert owner_addresses(address, json.dumps(rules), True) == []
 
     def test_regex_owner_map_shared_by_principal_and_reply_to(self):
         from types import SimpleNamespace
@@ -1396,6 +1587,93 @@ class TestStoredSchedulingRevision(BaseTest):
                  login="jeff:password", http_if_match='"stale"')
 
 
+class TestCalendarAddressWiring(BaseTest):
+    def setup_method(self):
+        TestStoredSchedulingRevision.setup_method(self)
+
+    @pytest.mark.parametrize("itip_enabled", [False, True])
+    @pytest.mark.parametrize("encoded,expected", [
+        ("alice%2Btag", "alice+tag@example.com"),
+        ("alice%252Btag", "alice%2btag@example.com"),
+        ("alice%3Ftag", "alice?tag@example.com"),
+        ("alice%23tag", "alice#tag@example.com"),
+    ])
+    def test_encoded_calendar_addresses_use_canonical_smtp_recipient(
+            self, monkeypatch, itip_enabled, encoded, expected):
+        from email import message_from_string, policy
+
+        from radicale.hook.email import EmailConfig
+
+        sent = []
+
+        def capture_smtp(config, text, to_addresses):
+            sent.append((to_addresses, message_from_string(text, policy=policy.default)))
+            return True
+
+        monkeypatch.setattr(EmailConfig, "_smtp_send", capture_smtp)
+        self.configure({"hook": {
+            "dryrun": "False", "itip_enabled": itip_enabled,
+            "from_email": "jeff+tag@example.com",
+            "itip_owner_map": '{"jeff": "jeff+tag@example.com"}'}})
+        source = TestStoredSchedulingRevision._source(
+            self, [("Alice", encoded + "@example.com", "")], 1).replace(
+                "mailto:jeff@example.com", "MAILTO:JEFF%2BTag@EXAMPLE.COM")
+        self.put(self.path, source, login="jeff:password")
+        assert len(sent) == 1
+        recipients, message = sent[0]
+        assert recipients == [expected]
+        if itip_enabled:
+            assert str(message["To"]) == expected
+            calendars = [part for part in message.walk()
+                         if part.get_content_type() == "text/calendar"]
+            assert len(calendars) == 1
+            wire = vobject.readOne(calendars[0].get_payload(decode=True).decode())
+            assert extract_email(wire.vevent.organizer.value) == "jeff+tag@example.com"
+            assert extract_email(wire.vevent.attendee.value) == expected
+
+    @pytest.mark.parametrize("case,original,replacement", [
+        item for item in _unsupported_identity_cases()
+        if item[0] in ("organizer-bare", "attendee-bare", "other-attendee-bare",
+                       "other-attendee-query", "other-attendee-SENT-BY",
+                       "duplicate-attendee", "encoded-duplicate-attendee")])
+    def test_unsupported_identity_does_not_trigger_revisions_or_cancellation(
+            self, monkeypatch, case, original, replacement):
+        sent = TestStoredSchedulingRevision._capture(self, monkeypatch)
+        supported = TestStoredSchedulingRevision._source(self, [ALICE, BOB], 5)
+        unsupported = supported.replace(original, replacement).replace(
+            "SEQUENCE:5", "SEQUENCE:1").replace("LOCATION:Home", "LOCATION:Away")
+        self.put(self.path, unsupported, login="jeff:password")
+        assert sent == [], case
+        self.put(self.path, supported, check=204, login="jeff:password")
+        assert sent == [], case
+        _, headers, _ = self.request("PUT", self.path, unsupported, check=204,
+                                     login="jeff:password")
+        assert "ETag" in headers
+        _, stored = TestStoredSchedulingRevision._stored(self)
+        assert int(stored.vevent.sequence.value) == 1
+        assert stored.vevent.location.value == "Away"
+        assert sent == [], case
+        self.delete(self.path, login="jeff:password")
+        self.get(self.path, check=404, login="jeff:password")
+        assert sent == [], case
+
+    def test_legacy_notifications_keep_bare_calendar_mailboxes(self, monkeypatch):
+        from radicale.hook.email import EmailConfig
+
+        sent = []
+
+        def capture_smtp(config, text, to_addresses):
+            sent.extend(to_addresses)
+            return True
+
+        monkeypatch.setattr(EmailConfig, "_smtp_send", capture_smtp)
+        self.configure({"hook": {"dryrun": "False", "itip_enabled": "False"}})
+        source = TestStoredSchedulingRevision._source(self, [ALICE, BOB], 1).replace(
+            "mailto:alice@example.com", "alice@example.com")
+        self.put(self.path, source, login="jeff:password")
+        assert sent == ["alice@example.com", "bob@example.com"]
+
+
 class TestOrganizerAttendeeChangesWiring(BaseTest):
     def setup_method(self):
         TestStoredSchedulingRevision.setup_method(self)
@@ -1848,6 +2126,21 @@ class TestCalendarUserAddressSet(BaseTest):
         self._enable(False, owner_map='{"jeff": "jeff@example.com"}')
         assert self._hrefs("/jeff/", "jeff") == [
             "mailto:jeff@example.com", "/jeff/"]
+
+    @pytest.mark.parametrize("address,href", [
+        ("jeff%2Btag@example.com", "mailto:jeff%252btag@example.com"),
+        ("jeff%tag@example.com", "mailto:jeff%25tag@example.com"),
+        ("jeff+tag@example.com", "mailto:jeff%2Btag@example.com"),
+        ("jeff?tag@example.com", "mailto:jeff%3Ftag@example.com"),
+        ("jeff#tag@example.com", "mailto:jeff%23tag@example.com"),
+    ])
+    def test_principal_mailto_href_preserves_bare_configured_mailbox(self, address, href):
+        import json
+
+        self._enable(False, owner_map=json.dumps({"jeff": address}))
+        hrefs = self._hrefs("/jeff/", "jeff")
+        assert hrefs == [href, "/jeff/"]
+        assert extract_email(hrefs[0]) == address.lower()
 
     def test_unmapped_user_gets_path_only(self):
         self._enable(False, owner_map='{"bob": "bob@example.com"}')

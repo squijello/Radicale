@@ -229,6 +229,58 @@ class TestPlanMessages:
         assert "SCHEDULE-FORCE-SEND" not in itip
 
 
+class TestOrganizerAttendeeChanges:
+    @pytest.mark.parametrize("previous_rsvp", ["", ";RSVP=FALSE", ";RSVP=false"])
+    def test_enabling_rsvp_requests_only_that_attendees_reconfirmation(self, previous_rsvp):
+        old = _event([("Alice", "alice@example.com", ";PARTSTAT=ACCEPTED" + previous_rsvp), BOB])
+        new = _event([("Alice", "alice@example.com", ";PARTSTAT=ACCEPTED;RSVP=TRUE"), BOB])
+        assert _recipients(plan(old, new)) == [
+            ("REQUEST", "alice@example.com", "reconfirmation")]
+        assert plan(old, new, owner=["bob@example.com"]) == []
+        assert plan(new, new) == []
+
+    @pytest.mark.parametrize("previous_role,new_role", [
+        ("", ";ROLE=OPT-PARTICIPANT"),
+        (";ROLE=OPT-PARTICIPANT", ""),
+        (";ROLE=REQ-PARTICIPANT", ";ROLE=CHAIR")])
+    def test_role_change_updates_only_the_affected_attendee(self, previous_role, new_role):
+        old = _event([("Alice", "alice@example.com", previous_role), BOB])
+        new = _event([("Alice", "alice@example.com", new_role), BOB])
+        assert _recipients(plan(old, new)) == [("REQUEST", "alice@example.com", "updated")]
+        assert plan(old, new, owner=[]) == []
+
+    @pytest.mark.parametrize("previous,new", [
+        ("", ";ROLE=REQ-PARTICIPANT"),
+        (";ROLE=REQ-PARTICIPANT", ";ROLE=req-participant"),
+        (";RSVP=TRUE", ";RSVP=true"),
+        ("", ";RSVP=FALSE")])
+    def test_explicit_defaults_and_parameter_case_do_not_notify(self, previous, new):
+        assert plan(_event([("Alice", "alice@example.com", previous)]),
+                    _event([("Alice", "alice@example.com", new)])) == []
+
+    @pytest.mark.parametrize("rsvp", [";RSVP=TRUE", ";RSVP=FALSE", ""])
+    @pytest.mark.parametrize("partstat", ["ACCEPTED", "TENTATIVE", "DECLINED"])
+    def test_response_state_changes_do_not_request_reconfirmation(self, rsvp, partstat):
+        old = _event([("Alice", "alice@example.com", ";PARTSTAT=NEEDS-ACTION;RSVP=TRUE"), BOB])
+        new = _event([("Alice", "alice@example.com", ";PARTSTAT=" + partstat + rsvp), BOB])
+        assert plan(old, new) == []
+
+    @pytest.mark.parametrize("agent", ["CLIENT", "NONE"])
+    @pytest.mark.parametrize("change", [";RSVP=TRUE", ";ROLE=OPT-PARTICIPANT"])
+    def test_attendee_edits_honor_current_schedule_agent(self, agent, change):
+        old = _event([ALICE, BOB])
+        new = _event([("Alice", "alice@example.com", ";SCHEDULE-AGENT=" + agent + change), BOB])
+        assert plan(old, new) == []
+
+    def test_simultaneous_details_role_and_rsvp_changes_do_not_duplicate_requests(self):
+        old = _event([ALICE, BOB])
+        new = _event([("Alice", "alice@example.com", ";RSVP=TRUE;ROLE=OPT-PARTICIPANT"), BOB])
+        new = new.replace("LOCATION:Home", "LOCATION:Away")
+        assert _recipients(plan(old, new)) == [
+            ("REQUEST", "alice@example.com", "updated"),
+            ("REQUEST", "bob@example.com", "updated")]
+
+
 class TestRecurrenceFingerprint:
     def _source(self, properties, all_day=False):
         source = _event([ALICE, BOB])
@@ -1340,6 +1392,77 @@ class TestStoredSchedulingRevision(BaseTest):
         monkeypatch.setattr(Hook, "prepare_upload", fail_if_prepared)
         self.put(self.path, self._source([ALICE], 2), check=412,
                  login="jeff:password", http_if_match='"stale"')
+
+
+class TestOrganizerAttendeeChangesWiring(BaseTest):
+    def setup_method(self):
+        TestStoredSchedulingRevision.setup_method(self)
+
+    def _source(self, parameters, sequence=5):
+        return TestStoredSchedulingRevision._source(
+            self, [("Alice", "alice@example.com", parameters), BOB], sequence)
+
+    @pytest.mark.parametrize("previous,supplied,expected", [
+        (5, 3, 5), (5, 5, 5), (5, 9, 9), (2147483647, 2147483647, 2147483647)])
+    def test_reconfirmation_preserves_revision_and_response_does_not_loop(
+            self, monkeypatch, previous, supplied, expected):
+        sent = TestStoredSchedulingRevision._capture(self, monkeypatch)
+        old = self._source(";PARTSTAT=ACCEPTED;RSVP=FALSE;ROLE=REQ-PARTICIPANT", previous)
+        self.put(self.path, old, login="jeff:password")
+        sent.clear()
+        new = self._source(";PARTSTAT=ACCEPTED;RSVP=TRUE;ROLE=REQ-PARTICIPANT", supplied)
+        self.put(self.path, new, check=204, login="jeff:password")
+        assert len(sent) == 1
+        assert sent[0].method.value == "REQUEST"
+        assert sent[0].vevent.attendee.value == "mailto:alice@example.com"
+        assert sent[0].vevent.attendee.params["RSVP"] == ["TRUE"]
+        assert int(sent[0].vevent.sequence.value) == expected
+        _, stored = TestStoredSchedulingRevision._stored(self)
+        assert int(stored.vevent.sequence.value) == expected
+        sent.clear()
+        # A later response changes PARTSTAT while RSVP remains TRUE.
+        stored.vevent.attendee.params["PARTSTAT"] = ["DECLINED"]
+        self.put(self.path, stored.serialize(), check=204, login="jeff:password")
+        assert sent == []
+
+    @pytest.mark.parametrize("change,supplied,expected,recipients", [
+        ("role", 5, 6, ["alice@example.com"]),
+        ("role", 9, 9, ["alice@example.com"]),
+        ("role-and-rsvp", 5, 6, ["alice@example.com"]),
+        ("location-and-rsvp", 5, 6, ["alice@example.com", "bob@example.com"])])
+    def test_content_changes_advance_revision_with_one_request_per_recipient(
+            self, monkeypatch, change, supplied, expected, recipients):
+        sent = TestStoredSchedulingRevision._capture(self, monkeypatch)
+        self.put(self.path, self._source(";PARTSTAT=ACCEPTED;RSVP=FALSE"), login="jeff:password")
+        sent.clear()
+        parameters = ";PARTSTAT=ACCEPTED;RSVP=" + ("TRUE" if "rsvp" in change else "FALSE")
+        if "role" in change:
+            parameters += ";ROLE=OPT-PARTICIPANT"
+        new = self._source(parameters, supplied)
+        if "location" in change:
+            new = new.replace("LOCATION:Home", "LOCATION:Away")
+        self.put(self.path, new, check=204, login="jeff:password")
+        assert [message.vevent.attendee.value for message in sent] == [
+            "mailto:" + recipient for recipient in recipients]
+        assert all(message.method.value == "REQUEST" for message in sent)
+        assert all(int(message.vevent.sequence.value) == expected for message in sent)
+        _, stored = TestStoredSchedulingRevision._stored(self)
+        assert int(stored.vevent.sequence.value) == expected
+        sent.clear()
+        stored.vevent.attendee.params["PARTSTAT"] = ["TENTATIVE"]
+        self.put(self.path, stored.serialize(), check=204, login="jeff:password")
+        assert sent == []
+
+    def test_reconfirmation_and_another_attendees_role_share_new_revision(self, monkeypatch):
+        sent = TestStoredSchedulingRevision._capture(self, monkeypatch)
+        self.put(self.path, self._source(";RSVP=FALSE"), login="jeff:password")
+        sent.clear()
+        new = self._source(";RSVP=TRUE").replace(
+            "ATTENDEE;CN=Bob:", "ATTENDEE;CN=Bob;ROLE=OPT-PARTICIPANT:")
+        self.put(self.path, new, check=204, login="jeff:password")
+        assert [message.vevent.attendee.value for message in sent] == [
+            "mailto:alice@example.com", "mailto:bob@example.com"]
+        assert [int(message.vevent.sequence.value) for message in sent] == [6, 6]
 
 
 class TestRecurringSchedulingPastGuard(BaseTest):

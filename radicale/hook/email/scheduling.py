@@ -143,6 +143,8 @@ class AttendeeInfo:
     name: Optional[str] = None
     schedule_agent: Optional[str] = None
     partstat: Optional[str] = None
+    rsvp: bool = False
+    role: str = "REQ-PARTICIPANT"
 
 
 @dataclass
@@ -203,6 +205,8 @@ def parse_event(ics: Optional[str]) -> Optional[EventInfo]:
                 name=_param_of(line, "CN"),
                 schedule_agent=_param_of(line, "SCHEDULE-AGENT"),
                 partstat=_param_of(line, "PARTSTAT"),
+                rsvp=(_param_of(line, "RSVP") or "").upper() == "TRUE",
+                role=(_param_of(line, "ROLE") or "REQ-PARTICIPANT").upper(),
             )
 
     def raw(name: str):
@@ -241,7 +245,8 @@ class PlannedMessage:
     method: str  # "REQUEST" or "CANCEL"
     recipient_email: str
     recipient_name: Optional[str]
-    # "created", "added", "removed", "updated", "cancelled" or "deleted".
+    # "created", "added", "removed", "updated", "reconfirmation",
+    # "cancelled" or "deleted".
     kind: str
 
 
@@ -498,10 +503,19 @@ def plan_messages(old_ics: Optional[str], new_ics: Optional[str],
     for email, attendee in old_event.attendees.items():
         if email not in new_event.attendees and _eligible(old_event, attendee):
             planned.append(PlannedMessage("CANCEL", email, attendee.name, "removed"))
-    if new_event.details != old_event.details:
-        for email, attendee in new_event.attendees.items():
-            if email in old_event.attendees and _eligible(new_event, attendee):
-                planned.append(PlannedMessage("REQUEST", email, attendee.name, "updated"))
+    details_changed = new_event.details != old_event.details
+    for email, attendee in new_event.attendees.items():
+        previous = old_event.attendees.get(email)
+        if previous is None or not _eligible(new_event, attendee):
+            continue
+        if details_changed or attendee.role != previous.role:
+            kind = "updated"
+        elif attendee.rsvp and not previous.rsvp:
+            kind = "reconfirmation"
+        else:
+            # PARTSTAT and response-side RSVP clearing do not invite again.
+            continue
+        planned.append(PlannedMessage("REQUEST", email, attendee.name, kind))
     return planned
 
 
@@ -531,9 +545,10 @@ def prepare_itip_upload(old_ics: Optional[str], new_ics: str,
                         owner_identities: Optional[Sequence[str]]) -> Optional[str]:
     """Persist a revision floor before sending messages for an owned event.
 
-    A scheduling change advances beyond the stored revision. A response-only
-    or no-op save preserves the greater stored/client revision. The stored
-    value is then used on the wire, so later replies and reinvitations use
+    A content or membership change advances beyond the stored revision.
+    Reconfirmation, response-only and no-op saves preserve the greater
+    stored/client revision. The stored value is then used on the wire,
+    so later replies and reinvitations use
     the same revision space. Unsupported objects are left unchanged.
     """
     new_event = parse_event(new_ics)
@@ -551,7 +566,9 @@ def prepare_itip_upload(old_ics: Optional[str], new_ics: str,
         return None
     old_sequence = _event_sequence(vobject.readOne(old_ics).vevent)
     target = max(old_sequence, new_sequence)
-    if plan_messages(old_ics, new_ics, owner_identities=owner_identities):
+    planned = plan_messages(old_ics, new_ics, owner_identities=owner_identities)
+    # RFC 5546 section 3.2.2.7 keeps SEQUENCE for a pure RSVP re-request.
+    if any(message.kind != "reconfirmation" for message in planned):
         target = max(old_sequence + 1, target)
     if target > MAX_SEQUENCE:
         raise ValueError("scheduling SEQUENCE is exhausted; create a meeting with a new UID")

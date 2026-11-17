@@ -2277,13 +2277,22 @@ does not send another message.
 Attendees with `SCHEDULE-AGENT=CLIENT` or `SCHEDULE-AGENT=NONE` do not receive
 server-generated messages.
 
+Changing an existing attendee's `RSVP` from absent or `FALSE` to `TRUE` sends
+that attendee a `REQUEST` for reconfirmation. An unchanged `RSVP=TRUE` does not
+repeat the request. Changes to an attendee's `ROLE` send that attendee an
+updated request. `PARTSTAT` changes, including a response that clears `RSVP`,
+do not generate another invitation. A simultaneous event-detail change still
+sends only one request to each affected attendee.
+
 For supported organizer-owned member `PUT`s, the hook maintains a non-decreasing
 stored `SEQUENCE`. An omitted property means revision zero; the hook adds it
-when a later save needs an explicit revision. A change that generates scheduling
-messages stores at least the previous sequence plus one, preserving a higher
-client-supplied value.
-Other saves retain the greater stored/client value without generating extra
-messages. Update notifications use that stored revision, including attendee
+when a later save needs an explicit revision. A content or membership change
+that generates scheduling messages stores at least the previous sequence plus
+one, preserving a higher client-supplied value.
+Pure RSVP reconfirmation keeps the greater stored/client revision without a
+server increment, as specified by RFC 5546 section 3.2.2.7. Other saves retain
+the greater stored/client value without generating extra messages.
+Update notifications use that stored revision, including attendee
 removals and status cancellation. When the hook changes the uploaded revision,
 the `PUT` response omits `ETag`; retrieve the stored object and its strong ETag
 with `GET` before the next conditional edit. A stale `If-Match` still fails

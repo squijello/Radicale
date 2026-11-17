@@ -2321,7 +2321,10 @@ Requires the email hook (`type = email`), SMTP configuration, and a non-empty
 be used with `mass_email = True`.
 
 Only resources containing a single `VEVENT` are supported, including recurring
-masters using `RRULE` or `RDATE`. The first occurrence's end does not suppress
+masters using `RRULE` or `RDATE` with `DATE` or `DATE-TIME` values.
+`RDATE;VALUE=PERIOD` is outside the verified iTIP subset. With the tested
+vobject 0.9.9 dependency, those uploads are rejected before storage.
+The first occurrence's end does not suppress
 iTIP notifications for a recurring master. If either the previous or new event
 has recurrence, organizer changes are considered even when the first occurrence
 is in the past, including removal of the recurrence property. The hook does not

@@ -1,6 +1,7 @@
 # Changelog
 
 ## 3.9.3.dev
+* Docs: [hook/email] clarify supported recurrence values and the scope of MIME serialization tests
 * Fix: [hook/email] bound SMTP socket operations and contain transport failures without masking committed calendar writes
 * Fix: [hook/email] send organizer RSVP reconfirmations and ROLE changes without repeating invitations for attendee response edits
 * Fix: [hook/email] detect changes across complete recurrence properties without notifying for equivalent date regrouping

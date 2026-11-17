@@ -968,10 +968,9 @@ class TestOwnerMapAndRecurrence:
         with pytest.raises(ValueError):
             cfg.validate_itip_config()
 
-    def test_itip_message_parses_as_client_would(self):
-        # Client-compatibility check without a GUI client: parse the
-        # MIME message the way Gmail/Outlook/Thunderbird would, and
-        # require method, METHOD property, recipient, and no leak.
+    def test_itip_message_round_trips_through_stdlib_parser(self):
+        # Check MIME method, calendar METHOD and recipient isolation after
+        # serializing and parsing with the standard-library email parser.
         import email
         from email import policy
         new = _event([ALICE, CAROL])

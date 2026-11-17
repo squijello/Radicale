@@ -921,6 +921,28 @@ class TestReplyToEndToEnd(BaseTest):
 class TestHookWiringLegacy(BaseTest):
     """With itip_enabled off, the hook uses the legacy path, not the planner."""
 
+    @pytest.mark.parametrize("prefix", ["", "mailto:"])
+    @pytest.mark.parametrize("itip", [False, True])
+    def test_quoted_mailbox_remains_deliverable_in_legacy_mode(self, monkeypatch, prefix, itip):
+        from radicale.hook.email import EmailConfig
+
+        self.configure({"auth": {"type": "none"},
+                        "hook": {"itip_enabled": str(itip), "dryrun": "False",
+                                 "itip_owner_map": '{"jeff": "jeff@example.com"}'}})
+        sent = []
+
+        def capture(config, text, to_addresses):
+            sent.append(to_addresses)
+            return True
+
+        monkeypatch.setattr(EmailConfig, "_smtp_send", capture)
+        self.mkcalendar("/calendar.ics/", login="jeff:password")
+        source = TestHookWiring._future_event(self, [ALICE], datetime.now() + timedelta(days=2))
+        address = '"guest.name"@example.com'
+        source = source.replace("mailto:alice@example.com", prefix + address)
+        self.put("/calendar.ics/quoted.ics", source, login="jeff:password")
+        assert sent == ([] if itip else [[address]])
+
     def setup_method(self) -> None:
         BaseTest.setup_method(self)
         import os

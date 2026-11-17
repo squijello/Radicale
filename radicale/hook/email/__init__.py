@@ -207,6 +207,23 @@ def ics_contents_contains_event(contents: str):
     return read_ics_event(contents) is not None
 
 
+def _legacy_extract_email(value: str) -> Optional[str]:
+    """Keep legacy recipient forms while using normalized supported mailto URIs.
+
+    iTIP authorization and planning use the strict scheduling extractor.
+    Legacy notification recipients historically also include quoted mailboxes
+    and local domains, which must not disappear when iTIP is disabled.
+    """
+    normalized = extract_email(value)
+    if normalized is not None or not value:
+        return normalized
+    value = value.strip().lower()
+    match = re.search(r"mailto:([^;]+)", value)
+    if match:
+        return match.group(1)
+    return value if "@" in value else None
+
+
 def determine_added_removed_and_unaltered_attendees(original_event: 'Event',
                                                     new_event: 'Event') -> (
         Tuple)[List['Attendee'], List['Attendee'], List['Attendee']]:
@@ -329,7 +346,7 @@ class Attendee(ContentLine):
     @property
     def email(self) -> Optional[str]:
         """Return the email address of the attendee."""
-        return extract_email(self.value)
+        return _legacy_extract_email(self.value)
 
     @property
     def role(self) -> Optional[str]:
@@ -349,7 +366,7 @@ class Attendee(ContentLine):
     def delegated_from(self) -> Optional[str]:
         """Return the email address of the attendee who delegated this attendee."""
         delegate = self._get_param("DELEGATED-FROM")[0]
-        return extract_email(delegate) if delegate else None
+        return _legacy_extract_email(delegate) if delegate else None
 
 
 class TimeWithTimezone(ContentLine):

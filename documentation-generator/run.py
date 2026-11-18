@@ -39,6 +39,11 @@ PROG = "documentation-generator"
 VENV_EXECUTABLE = "venv/bin/python3"
 
 
+def branch_filename(branch, extension):
+    """Keep branch documents flat and distinguish slashes from literal escapes."""
+    return "%s.%s" % (urllib.parse.quote(branch, safe=""), extension)
+
+
 def convert_doc(src_path, to_path, branch, branches):
     with NamedTemporaryFile(mode="w", prefix="%s-" % PROG,
                             suffix=".json") as metadata_file:
@@ -46,7 +51,7 @@ def convert_doc(src_path, to_path, branch, branches):
             "document-css": False,
             "branch": branch,
             "branches": [{"name": b,
-                          "href": urllib.parse.quote_plus("%s.html" % b),
+                          "href": urllib.parse.quote_plus(branch_filename(b, "html")),
                           "default": b == branch}
                          for b in reversed(branches)]}, metadata_file)
         metadata_file.flush()
@@ -146,7 +151,7 @@ def main():
                 continue
             checkout(branch)
             if os.path.exists(DOCUMENTATION_SRC):
-                branch_docs[branch] = os.path.join(temp, "%s.md" % branch)
+                branch_docs[branch] = os.path.join(temp, branch_filename(branch, "md"))
                 shutil.copy(DOCUMENTATION_SRC, branch_docs[branch])
             else:
                 print("Skip branch (no doc file found): %s" % branch, file=sys.stderr)
@@ -156,7 +161,7 @@ def main():
             run_git("rm", "--", path)
         branches, default_branch = sort_branches(branches)
         for branch, src_path in branch_docs.items():
-            to_path = "%s.html" % branch
+            to_path = branch_filename(branch, "html")
             convert_doc(src_path, to_path, branch, branches)
             run_git("add", "--", to_path)
     try:
@@ -172,7 +177,7 @@ def main():
                 raise RuntimeError("no default branch")
             target = default_branch
         source_path = "%s.html" % str(source)
-        target_url = urllib.parse.quote_plus("%s.html" % str(target))
+        target_url = urllib.parse.quote_plus(branch_filename(str(target), "html"))
         with open(source_path, "w") as f:
             f.write(redirect_template.format(target=target_url))
         run_git("add", "--", source_path)
